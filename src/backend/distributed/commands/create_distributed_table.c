@@ -1580,12 +1580,13 @@ ConvertCitusLocalTableToTableType(Oid relationId, CitusTableType tableType,
 	{
 		/*
 		 * If we're on a worker, first acquire the lock on the coordinator via
-		 * the remote metadata connection to the coordinator. Fwiw, we'll acquire
-		 * the lock on the local node as well via ActivePrimaryNonCoordinatorNodeList().
+		 * the remote metadata connection to the coordinator as superuser. Fwiw,
+		 * we'll acquire the lock on the local node as well via
+		 * ActivePrimaryNonCoordinatorNodeList().
 		 */
 		if (!IsCoordinator())
 		{
-			SendCommandToCoordinator(LockPgDistNodeCommand(ShareLock));
+			LockPgDistNodeOnCoordinatorViaSuperUser(ShareLock);
 		}
 
 		targetNodeList = ActivePrimaryNonCoordinatorNodeList(ShareLock);

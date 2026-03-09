@@ -65,7 +65,6 @@ extern char *WorkerListFileName;
 extern char *CurrentCluster;
 
 /* Function declarations for finding worker nodes to place shards on */
-extern char * LockPgDistNodeCommand(LOCKMODE lockMode);
 extern WorkerNode * WorkerGetRandomCandidateNode(List *currentNodeList);
 extern WorkerNode * WorkerGetRoundRobinCandidateNode(List *workerNodeList,
 													 uint64 shardId,
@@ -96,6 +95,7 @@ extern void EnsurePropagationToCoordinator(void);
 extern void EnsureCoordinatorUnlessTenantSchema(Oid relationId);
 extern void EnsureCoordinatorIsInMetadata(void);
 extern void InsertCoordinatorIfClusterEmpty(void);
+extern void LockPgDistNodeOnCoordinatorViaSuperUser(LOCKMODE lockMode);
 extern uint32 GroupForNode(char *nodeName, int32 nodePort);
 extern WorkerNode * PrimaryNodeForGroup(int32 groupId, bool *groupContainsNodes);
 extern bool NodeIsPrimaryAndRemote(WorkerNode *worker);

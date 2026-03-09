@@ -879,12 +879,13 @@ WorkersWithoutReferenceTablePlacement(uint64 shardId, LOCKMODE lockMode)
 
 	/*
 	 * If we're on a worker, first acquire the lock on the coordinator via the
-	 * remote metadata connection to the coordinator. Fwiw, we'll acquire the
-	 * lock on the local node as well via ReferenceTablePlacementNodeList().
+	 * remote metadata connection to the coordinator as superuser. Fwiw, we'll
+	 * acquire the lock on the local node as well via
+	 * ReferenceTablePlacementNodeList().
 	 */
 	if (!IsCoordinator())
 	{
-		SendCommandToCoordinator(LockPgDistNodeCommand(lockMode));
+		LockPgDistNodeOnCoordinatorViaSuperUser(lockMode);
 	}
 
 	List *workerNodeList = ReferenceTablePlacementNodeList(lockMode);
