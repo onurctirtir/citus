@@ -110,7 +110,6 @@ PG_FUNCTION_INFO_V1(lock_shard_metadata);
 PG_FUNCTION_INFO_V1(lock_shard_resources);
 PG_FUNCTION_INFO_V1(lock_relation_if_exists);
 PG_FUNCTION_INFO_V1(citus_internal_lock_colocation_id);
-PG_FUNCTION_INFO_V1(citus_internal_lock_pg_dist_node);
 
 /* Config variable managed via guc.c */
 bool EnableAcquiringUnsafeLockFromWorkers = false;
@@ -264,32 +263,6 @@ lock_shard_resources(PG_FUNCTION_ARGS)
 
 		LockShardResource(shardId, lockMode);
 	}
-
-	PG_RETURN_VOID();
-}
-
-
-/*
- * citus_internal_lock_pg_dist_node acquires a lock on pg_dist_node with the
- * given lock mode as superuser.
- */
-Datum
-citus_internal_lock_pg_dist_node(PG_FUNCTION_ARGS)
-{
-	CheckCitusVersion(ERROR);
-
-	PG_ENSURE_ARGNOTNULL(0, "lock_mode");
-	LOCKMODE lockMode = IntToLockMode(PG_GETARG_INT32(0));
-
-	Oid savedUserId = InvalidOid;
-	int savedSecurityContext = 0;
-
-	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
-	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
-
-	LockRelationOid(DistNodeRelationId(), lockMode);
-
-	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
 	PG_RETURN_VOID();
 }
@@ -465,12 +438,26 @@ LockShardListMetadataOnWorkers(LOCKMODE lockmode, List *shardIntervalList)
 static LOCKMODE
 IntToLockMode(int mode)
 {
-	if (mode < NoLock || mode > MaxLockMode)
+	if (mode == ExclusiveLock)
+	{
+		return ExclusiveLock;
+	}
+	else if (mode == ShareLock)
+	{
+		return ShareLock;
+	}
+	else if (mode == AccessShareLock)
+	{
+		return AccessShareLock;
+	}
+	else if (mode == RowExclusiveLock)
+	{
+		return RowExclusiveLock;
+	}
+	else
 	{
 		elog(ERROR, "unsupported lockmode %d", mode);
 	}
-
-	return mode;
 }
 
 
