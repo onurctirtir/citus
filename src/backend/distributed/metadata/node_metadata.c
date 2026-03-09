@@ -687,15 +687,14 @@ BlockDistributedQueriesOnMetadataNodes(void)
 
 /*
  * LockPgDistNodeCommand returns the command to acquire the lock on pg_dist_node
- * with the given lock mode.
+ * with the given lock mode as superuser.
  */
 char *
 LockPgDistNodeCommand(LOCKMODE lockMode)
 {
-	StringInfo lockCommand = makeStringInfo();
-	appendStringInfo(lockCommand, "LOCK TABLE pg_catalog.pg_dist_node IN %s MODE;",
-					 LockModeToLockModeText(lockMode));
-	return lockCommand->data;
+	StringInfo command = makeStringInfo();
+	appendStringInfo(command, "SELECT citus_internal.lock_pg_dist_node(%d)", lockMode);
+	return command->data;
 }
 
 
