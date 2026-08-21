@@ -16,6 +16,7 @@
 #include "catalog/objectaddress.h"
 #include "commands/extension.h"
 #include "storage/lmgr.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 
 #include "distributed/commands.h"
@@ -24,6 +25,7 @@
 #include "distributed/listutils.h"
 #include "distributed/metadata/dependency.h"
 #include "distributed/metadata/distobject.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_executor.h"
 #include "distributed/relation_access_tracking.h"
@@ -861,12 +863,34 @@ FilterObjectAddressListByPredicate(List *objectAddressList, AddressPredicate pre
 {
 	List *result = NIL;
 
+	int64 processedCount = 0;
 	ObjectAddress *address = NULL;
 	foreach_declared_ptr(address, objectAddressList)
 	{
 		if (predicate(address))
 		{
 			result = lappend(result, address);
+		}
+
+		/*
+		 * The predicate (e.g. SupportedDependencyByCitus) opens catalogs and
+		 * distributed relations per object, accumulating PostgreSQL
+		 * relcache/catcache and Citus metadata cache entries on the
+		 * coordinator. For a very large number of objects this transient cache
+		 * growth can exhaust coordinator memory. We periodically flush those
+		 * caches at this safe boundary, where we hold no live pointers into
+		 * them: both the input and result lists only hold ObjectAddresses
+		 * (plain OIDs), and the caches are transparently rebuilt on the next
+		 * access. This mirrors the flushing done while ordering the dependency
+		 * list and sending the dependency creation commands (see
+		 * OrderObjectAddressListInDependencyOrder() and
+		 * MaybeFlushMetadataSyncCaches()).
+		 */
+		if (MetadataSyncCacheFlushInterval > 0 &&
+			++processedCount % MetadataSyncCacheFlushInterval == 0)
+		{
+			FlushDistTableCache();
+			InvalidateSystemCaches();
 		}
 	}
 

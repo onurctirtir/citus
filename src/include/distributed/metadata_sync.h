@@ -30,6 +30,7 @@ typedef enum
 extern int MetadataSyncInterval;
 extern int MetadataSyncRetryInterval;
 extern int MetadataSyncTransMode;
+extern int MetadataSyncCacheFlushInterval;
 
 /*
  * MetadataSyncContext is used throughout metadata sync.

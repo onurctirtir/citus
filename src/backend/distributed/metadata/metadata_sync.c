@@ -51,6 +51,7 @@
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -99,6 +100,14 @@
 char *EnableManualMetadataChangesForUser = "";
 int MetadataSyncTransMode = METADATA_SYNC_TRANSACTIONAL;
 
+/*
+ * MetadataSyncCacheFlushInterval is the number of distributed relations we
+ * process between cache flushes while syncing metadata to a node. See
+ * MaybeFlushMetadataSyncCaches() and OrderObjectAddressListInDependencyOrder().
+ * Set via citus.metadata_sync_cache_flush_interval; 0 disables the flushing.
+ */
+int MetadataSyncCacheFlushInterval = 1000;
+
 
 static void EnsureObjectMetadataIsSane(int distributionArgumentIndex,
 									   int colocationId);
@@ -113,6 +122,8 @@ static NodeMetadataSyncResult SyncNodeMetadataToNodesOptional(void);
 static bool ShouldSyncTableMetadataInternal(bool hashDistributed,
 											bool citusTableWithNoDistKey);
 static bool SyncNodeMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError);
+static void MaybeFlushMetadataSyncCaches(MetadataSyncContext *context,
+										 int64 processedCount);
 static void DropMetadataSnapshotOnNode(WorkerNode *workerNode);
 static void FetchSequenceState(Oid sequenceId, int64 *lastValue, bool *isCalled);
 static char * CreateSequenceDependencyCommand(Oid relationId, Oid sequenceId,
@@ -5363,6 +5374,7 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 														  ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(commandsContext);
 	ObjectAddress *dependency = NULL;
+	int64 processedCount = 0;
 	foreach_declared_ptr(dependency, dependencies)
 	{
 		if (!MetadataSyncCollectsCommands(context))
@@ -5382,7 +5394,10 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 		/* dependency creation commands */
 		List *ddlCommands = GetAllDependencyCreateDDLCommands(list_make1(dependency));
 		SendOrCollectCommandListToActivatedNodes(context, ddlCommands);
+
+		MaybeFlushMetadataSyncCaches(context, ++processedCount);
 	}
+
 	MemoryContextSwitchTo(oldContext);
 
 	if (!MetadataSyncCollectsCommands(context))
@@ -5415,6 +5430,7 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 	HeapTuple nextTuple = NULL;
+	int64 processedCount = 0;
 	while (true)
 	{
 		ResetMetadataSyncMemoryContext(context);
@@ -5437,7 +5453,10 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 
 		List *commandList = CitusTableMetadataCreateCommandList(relationId);
 		SendOrCollectCommandListToActivatedNodes(context, commandList);
+
+		MaybeFlushMetadataSyncCaches(context, ++processedCount);
 	}
+
 	MemoryContextSwitchTo(oldContext);
 
 	systable_endscan(scanDesc);
@@ -5464,6 +5483,7 @@ SendDistObjectCommands(MetadataSyncContext *context)
 
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 	HeapTuple nextTuple = NULL;
+	int64 processedCount = 0;
 	while (true)
 	{
 		ResetMetadataSyncMemoryContext(context);
@@ -5526,9 +5546,13 @@ SendDistObjectCommands(MetadataSyncContext *context)
 												list_make1_int(distributionArgumentIndex),
 												list_make1_int(colocationId),
 												list_make1_int(forceDelegation));
+
 		SendOrCollectCommandListToActivatedNodes(context,
 												 list_make1(workerMetadataUpdateCommand));
+
+		MaybeFlushMetadataSyncCaches(context, ++processedCount);
 	}
+
 	MemoryContextSwitchTo(oldContext);
 
 	systable_endscan(scanDesc);
@@ -5560,6 +5584,7 @@ SendInterTableRelationshipCommands(MetadataSyncContext *context)
 
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 	HeapTuple nextTuple = NULL;
+	int64 processedCount = 0;
 	while (true)
 	{
 		ResetMetadataSyncMemoryContext(context);
@@ -5586,8 +5611,12 @@ SendInterTableRelationshipCommands(MetadataSyncContext *context)
 		}
 
 		List *commandList = InterTableRelationshipOfRelationCommandList(relationId);
+
 		SendOrCollectCommandListToActivatedNodes(context, commandList);
+
+		MaybeFlushMetadataSyncCaches(context, ++processedCount);
 	}
+
 	MemoryContextSwitchTo(oldContext);
 
 	systable_endscan(scanDesc);
@@ -5595,4 +5624,49 @@ SendInterTableRelationshipCommands(MetadataSyncContext *context)
 
 	/* enable ddl propagation */
 	SendOrCollectCommandListToActivatedNodes(context, list_make1(ENABLE_DDL_PROPAGATION));
+}
+
+
+/*
+ * MaybeFlushMetadataSyncCaches drops the distributed-table cache and the
+ * PostgreSQL relation/catalog caches that accumulate while metadata sync opens
+ * each distributed relation to build its DDL and metadata commands.
+ *
+ * Without this, syncing metadata for millions of distributed tables grows the
+ * backend caches without bound. The PostgreSQL relcache/catcache (in
+ * CacheMemoryContext) dominates, with the Citus metadata cache (in
+ * MetadataCacheMemoryContext) on top of it, and the coordinator can run out of
+ * memory long before the sync completes.
+ *
+ * We only flush when actually sending commands to workers, not while merely
+ * collecting them for a transactional sync (the collected command strings are
+ * self-contained and do not point into these caches). We flush once every
+ * citus.metadata_sync_cache_flush_interval processed relations so the amortized
+ * cost of rebuilding the caches on demand stays negligible.
+ *
+ * This is safe at a batch boundary, i.e. between two processed relations, where
+ * we hold no live pointers into the caches: the command strings we have already
+ * produced live in the metadata sync context, not in the caches, and the caches
+ * are transparently rebuilt on the next access.
+ */
+static void
+MaybeFlushMetadataSyncCaches(MetadataSyncContext *context, int64 processedCount)
+{
+	if (MetadataSyncCollectsCommands(context))
+	{
+		return;
+	}
+
+	if (MetadataSyncCacheFlushInterval <= 0 ||
+		processedCount == 0 ||
+		processedCount % MetadataSyncCacheFlushInterval != 0)
+	{
+		return;
+	}
+
+	/* free the Citus distributed-table cache built so far */
+	FlushDistTableCache();
+
+	/* free the PostgreSQL relcache/catcache entries built so far */
+	InvalidateSystemCaches();
 }

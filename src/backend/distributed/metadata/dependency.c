@@ -37,6 +37,7 @@
 #include "common/hashfn.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -338,6 +339,7 @@ OrderObjectAddressListInDependencyOrder(List *objectAddressList)
 	InitObjectAddressCollector(&collector);
 
 	ObjectAddress *objectAddress = NULL;
+	int64 processedCount = 0;
 	foreach_declared_ptr(objectAddress, objectAddressList)
 	{
 		if (IsObjectAddressCollected(*objectAddress, &collector))
@@ -353,6 +355,25 @@ OrderObjectAddressListInDependencyOrder(List *objectAddressList)
 								  &collector);
 
 		CollectObjectAddress(&collector, objectAddress);
+
+		/*
+		 * Building the dependency order opens each distributed relation (and its
+		 * dependencies) to traverse pg_depend, which accumulates PostgreSQL
+		 * relcache/catcache and Citus metadata cache entries on the coordinator.
+		 * For a very large number of distributed objects this transient cache
+		 * growth can exhaust coordinator memory before the ordered list is even
+		 * returned. We periodically flush those caches at this safe boundary,
+		 * where we hold no live pointers into them: the collector only keeps
+		 * ObjectAddresses (plain OIDs), and the caches are transparently rebuilt
+		 * on the next access. This mirrors the flushing done while sending the
+		 * dependency creation commands (see MaybeFlushMetadataSyncCaches()).
+		 */
+		if (MetadataSyncCacheFlushInterval > 0 &&
+			++processedCount % MetadataSyncCacheFlushInterval == 0)
+		{
+			FlushDistTableCache();
+			InvalidateSystemCaches();
+		}
 	}
 
 	return collector.dependencyList;
