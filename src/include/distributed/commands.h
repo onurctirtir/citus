@@ -628,6 +628,7 @@ extern List * PreprocessAlterStatisticsOwnerStmt(Node *node, const char *querySt
 												 processUtilityContext);
 extern List * PostprocessAlterStatisticsOwnerStmt(Node *node, const char *queryString);
 extern List * GetExplicitStatisticsCommandList(Oid relationId);
+extern List * GetExplicitStatisticsDropIfExistsCommandList(Oid relationId);
 extern List * GetExplicitStatisticsSchemaIdList(Oid relationId);
 extern List * GetAlterIndexStatisticsCommands(Oid indexOid);
 

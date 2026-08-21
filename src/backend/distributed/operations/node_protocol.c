@@ -86,6 +86,10 @@ static void GatherIndexAndConstraintDefinitionListExcludingReplicaIdentity(Form_
 																		   indexDDLEventList,
 																		   int
 																		   indexFlags);
+static void GatherDropIndexIfExistsCommandList(Form_pg_index indexForm,
+											   List **dropIndexCommandList,
+											   int indexFlags);
+static List * ShellTableDropIndexIfExistsCommandList(Oid relationId);
 static Datum WorkerNodeGetDatum(WorkerNode *workerNode, TupleDesc tupleDescriptor);
 
 static char * CitusCreateAlterColumnarTableSet(char *qualifiedRelationName,
@@ -671,11 +675,82 @@ GetFullTableCreationCommands(Oid relationId,
 			IdentitySequenceDependencyCommandList(relationId);
 		tableDDLEventList = list_concat(tableDDLEventList,
 										identitySequenceDependencyCommandList);
+
+		/*
+		 * Make object (re)creation idempotent: a previously failed or interrupted
+		 * metadata sync can leave an orphan shell table on the worker (a physical
+		 * table with no pg_dist_partition row) whose index or extended-statistics
+		 * name collides with an object that the postload commands below (re)create
+		 * for this table. Index and statistics names live in a per-schema namespace
+		 * shared across tables, so such an orphan is not enumerable via the worker's
+		 * pg_dist_partition and can be dropped neither by the activation
+		 * shell-deletion phase nor by stop_metadata_sync_to_node(.., clear_metadata
+		 * => true). Dropping the conflicting object by name first lets a
+		 * re-activation succeed instead of failing with 'relation "<name>" already
+		 * exists' / 'statistics object "<name>" already exists'. The matching table
+		 * itself is already covered by the DROP TABLE IF EXISTS that precedes these
+		 * commands in the shell-table sync path.
+		 */
+		List *dropIndexCommandList =
+			ShellTableDropIndexIfExistsCommandList(relationId);
+		tableDDLEventList = list_concat(tableDDLEventList, dropIndexCommandList);
+
+		List *dropStatisticsCommandList =
+			GetExplicitStatisticsDropIfExistsCommandList(relationId);
+		tableDDLEventList = list_concat(tableDDLEventList, dropStatisticsCommandList);
 	}
 
 	tableDDLEventList = list_concat(tableDDLEventList, postLoadCreationCommandList);
 
 	return tableDDLEventList;
+}
+
+
+/*
+ * ShellTableDropIndexIfExistsCommandList returns a list of "DROP INDEX IF EXISTS"
+ * TableDDLCommands, one for each non-constraint index of the given relation. It
+ * is used while creating a shell table on a remote node to make the subsequent
+ * CREATE INDEX commands idempotent; see the comment on the drop lists in
+ * GetFullTableCreationCommands for why an orphan shell table can otherwise cause a
+ * name collision. Constraint-backed indexes are intentionally skipped: they are
+ * (re)created via ALTER TABLE ... ADD CONSTRAINT and cannot be removed with a
+ * plain DROP INDEX.
+ */
+static List *
+ShellTableDropIndexIfExistsCommandList(Oid relationId)
+{
+	return ExecuteFunctionOnEachTableIndex(relationId,
+										   GatherDropIndexIfExistsCommandList,
+										   0);
+}
+
+
+/*
+ * GatherDropIndexIfExistsCommandList appends a "DROP INDEX IF EXISTS" command for
+ * the given index to the provided list, unless the index backs a constraint.
+ */
+static void
+GatherDropIndexIfExistsCommandList(Form_pg_index indexForm, List **dropIndexCommandList,
+								   int indexFlags)
+{
+	if (IndexImpliedByAConstraint(indexForm))
+	{
+		/* constraint-backed indexes are dropped/recreated with their constraint */
+		return;
+	}
+
+	/* generate a fully-qualified name regardless of the current search_path */
+	int saveNestLevel = PushEmptySearchPath();
+
+	char *qualifiedIndexName = generate_qualified_relation_name(
+		indexForm->indexrelid);
+	StringInfo dropCommand = makeStringInfo();
+	appendStringInfo(dropCommand, "DROP INDEX IF EXISTS %s", qualifiedIndexName);
+
+	*dropIndexCommandList = lappend(*dropIndexCommandList,
+									makeTableDDLCommandString(dropCommand->data));
+
+	PopEmptySearchPath(saveNestLevel);
 }
 
 
