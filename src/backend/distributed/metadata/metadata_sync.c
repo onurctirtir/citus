@@ -108,6 +108,18 @@ int MetadataSyncTransMode = METADATA_SYNC_TRANSACTIONAL;
  */
 int MetadataSyncCacheFlushInterval = 1000;
 
+/*
+ * MetadataSyncBatchSize is the number of distributed objects (relations,
+ * dependencies, pg_dist_object entries) whose metadata-sync commands we
+ * accumulate and send to the activated nodes in a single round-trip while
+ * syncing metadata to a node. Batching drastically reduces the number of
+ * round-trips - and, in nontransactional mode, the number of remote
+ * transactions - when syncing millions of distributed tables. Set via
+ * citus.metadata_sync_batch_size; 1 disables batching and restores the
+ * previous one-object-per-round-trip behavior.
+ */
+int MetadataSyncBatchSize = 1000;
+
 
 static void EnsureObjectMetadataIsSane(int distributionArgumentIndex,
 									   int colocationId);
@@ -124,6 +136,10 @@ static bool ShouldSyncTableMetadataInternal(bool hashDistributed,
 static bool SyncNodeMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError);
 static void MaybeFlushMetadataSyncCaches(MetadataSyncContext *context,
 										 int64 processedCount);
+static bool MetadataSyncBatchingEnabled(MetadataSyncContext *context);
+static void SendOrBatchCommandListToActivatedNodes(MetadataSyncContext *context,
+												   List *commandList);
+static void FlushBatchedCommandsToActivatedNodes(MetadataSyncContext *context);
 static void DropMetadataSnapshotOnNode(WorkerNode *workerNode);
 static void FetchSequenceState(Oid sequenceId, int64 *lastValue, bool *isCalled);
 static char * CreateSequenceDependencyCommand(Oid relationId, Oid sequenceId,
@@ -4852,7 +4868,7 @@ SendOrCollectCommandListToActivatedNodes(MetadataSyncContext *context, List *com
 	else if (context->transactionMode == METADATA_SYNC_NON_TRANSACTIONAL)
 	{
 		List *workerConnections = context->activatedWorkerBareConnections;
-		SendCommandListToWorkerListWithBareConnections(workerConnections, commands);
+		ExecuteRemoteCommandsInConnectionsInPipelineMode(workerConnections, commands);
 	}
 	else
 	{
@@ -4944,7 +4960,7 @@ SendOrCollectCommandListToSingleNode(MetadataSyncContext *context, List *command
 
 		MultiConnection *workerConnection = list_nth(workerConnections, nodeIdx);
 		List *connectionList = list_make1(workerConnection);
-		SendCommandListToWorkerListWithBareConnections(connectionList, commands);
+		ExecuteRemoteCommandsInConnectionsInPipelineMode(connectionList, commands);
 	}
 	else
 	{
@@ -5375,9 +5391,18 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 	MemoryContextSwitchTo(commandsContext);
 	ObjectAddress *dependency = NULL;
 	int64 processedCount = 0;
+	bool batching = MetadataSyncBatchingEnabled(context);
+	context->batchedCommands = NIL;
+	context->batchedCount = 0;
+	context->batchContext = commandsContext;
 	foreach_declared_ptr(dependency, dependencies)
 	{
-		if (!MetadataSyncCollectsCommands(context))
+		/*
+		 * When batching we keep the accumulated commands alive in
+		 * commandsContext until we flush the batch, so we only reset the
+		 * context at batch boundaries (below). Otherwise reset per object.
+		 */
+		if (!batching && !MetadataSyncCollectsCommands(context))
 		{
 			MemoryContextReset(commandsContext);
 		}
@@ -5393,10 +5418,14 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 
 		/* dependency creation commands */
 		List *ddlCommands = GetAllDependencyCreateDDLCommands(list_make1(dependency));
-		SendOrCollectCommandListToActivatedNodes(context, ddlCommands);
+
+		SendOrBatchCommandListToActivatedNodes(context, ddlCommands);
 
 		MaybeFlushMetadataSyncCaches(context, ++processedCount);
 	}
+
+	/* send whatever remains in the final partial batch */
+	FlushBatchedCommandsToActivatedNodes(context);
 
 	MemoryContextSwitchTo(oldContext);
 
@@ -5431,9 +5460,21 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 	HeapTuple nextTuple = NULL;
 	int64 processedCount = 0;
+	bool batching = MetadataSyncBatchingEnabled(context);
+	context->batchedCommands = NIL;
+	context->batchedCount = 0;
+	context->batchContext = context->context;
 	while (true)
 	{
-		ResetMetadataSyncMemoryContext(context);
+		/*
+		 * When batching we keep the accumulated commands alive in the sync
+		 * memory context until we flush the batch, so we only reset the
+		 * context at batch boundaries (below). Otherwise reset per object.
+		 */
+		if (!batching)
+		{
+			ResetMetadataSyncMemoryContext(context);
+		}
 
 		nextTuple = systable_getnext(scanDesc);
 		if (!HeapTupleIsValid(nextTuple))
@@ -5452,10 +5493,14 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 		}
 
 		List *commandList = CitusTableMetadataCreateCommandList(relationId);
-		SendOrCollectCommandListToActivatedNodes(context, commandList);
+
+		SendOrBatchCommandListToActivatedNodes(context, commandList);
 
 		MaybeFlushMetadataSyncCaches(context, ++processedCount);
 	}
+
+	/* send whatever remains in the final partial batch */
+	FlushBatchedCommandsToActivatedNodes(context);
 
 	MemoryContextSwitchTo(oldContext);
 
@@ -5484,9 +5529,21 @@ SendDistObjectCommands(MetadataSyncContext *context)
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 	HeapTuple nextTuple = NULL;
 	int64 processedCount = 0;
+	bool batching = MetadataSyncBatchingEnabled(context);
+	context->batchedCommands = NIL;
+	context->batchedCount = 0;
+	context->batchContext = context->context;
 	while (true)
 	{
-		ResetMetadataSyncMemoryContext(context);
+		/*
+		 * When batching we keep the accumulated commands alive in the sync
+		 * memory context until we flush the batch, so we only reset the
+		 * context at batch boundaries (below). Otherwise reset per object.
+		 */
+		if (!batching)
+		{
+			ResetMetadataSyncMemoryContext(context);
+		}
 
 		nextTuple = systable_getnext(scanDesc);
 		if (!HeapTupleIsValid(nextTuple))
@@ -5547,11 +5604,14 @@ SendDistObjectCommands(MetadataSyncContext *context)
 												list_make1_int(colocationId),
 												list_make1_int(forceDelegation));
 
-		SendOrCollectCommandListToActivatedNodes(context,
-												 list_make1(workerMetadataUpdateCommand));
+		SendOrBatchCommandListToActivatedNodes(context,
+											   list_make1(workerMetadataUpdateCommand));
 
 		MaybeFlushMetadataSyncCaches(context, ++processedCount);
 	}
+
+	/* send whatever remains in the final partial batch */
+	FlushBatchedCommandsToActivatedNodes(context);
 
 	MemoryContextSwitchTo(oldContext);
 
@@ -5585,9 +5645,21 @@ SendInterTableRelationshipCommands(MetadataSyncContext *context)
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 	HeapTuple nextTuple = NULL;
 	int64 processedCount = 0;
+	bool batching = MetadataSyncBatchingEnabled(context);
+	context->batchedCommands = NIL;
+	context->batchedCount = 0;
+	context->batchContext = context->context;
 	while (true)
 	{
-		ResetMetadataSyncMemoryContext(context);
+		/*
+		 * When batching we keep the accumulated commands alive in the sync
+		 * memory context until we flush the batch, so we only reset the
+		 * context at batch boundaries (below). Otherwise reset per object.
+		 */
+		if (!batching)
+		{
+			ResetMetadataSyncMemoryContext(context);
+		}
 
 		nextTuple = systable_getnext(scanDesc);
 		if (!HeapTupleIsValid(nextTuple))
@@ -5612,10 +5684,13 @@ SendInterTableRelationshipCommands(MetadataSyncContext *context)
 
 		List *commandList = InterTableRelationshipOfRelationCommandList(relationId);
 
-		SendOrCollectCommandListToActivatedNodes(context, commandList);
+		SendOrBatchCommandListToActivatedNodes(context, commandList);
 
 		MaybeFlushMetadataSyncCaches(context, ++processedCount);
 	}
+
+	/* send whatever remains in the final partial batch */
+	FlushBatchedCommandsToActivatedNodes(context);
 
 	MemoryContextSwitchTo(oldContext);
 
@@ -5669,4 +5744,77 @@ MaybeFlushMetadataSyncCaches(MetadataSyncContext *context, int64 processedCount)
 
 	/* free the PostgreSQL relcache/catcache entries built so far */
 	InvalidateSystemCaches();
+}
+
+
+/*
+ * MetadataSyncBatchingEnabled returns whether metadata sync should accumulate
+ * the commands of multiple distributed objects and send them to the activated
+ * nodes in a single round-trip.
+ *
+ * We never batch while merely collecting commands: the collected command list
+ * must stay byte-for-byte identical to the unbatched path (batching only
+ * changes how commands are grouped on the wire, not their contents or order).
+ * A batch size of 1 disables batching and restores the previous
+ * one-object-per-round-trip behavior, which also keeps each object in its own
+ * remote transaction in nontransactional mode.
+ */
+static bool
+MetadataSyncBatchingEnabled(MetadataSyncContext *context)
+{
+	return !MetadataSyncCollectsCommands(context) && MetadataSyncBatchSize > 1;
+}
+
+
+/*
+ * SendOrBatchCommandListToActivatedNodes either sends commandList to the
+ * activated nodes immediately or, when batching is enabled, accumulates it into
+ * the current batch and flushes the batch (sending it to the nodes and resetting
+ * the batch memory context) once it reaches citus.metadata_sync_batch_size
+ * distributed objects.
+ *
+ * Callers that may batch must, before the first call in a loop, set
+ * context->batchContext to the memory context whose reset reclaims the memory
+ * backing the accumulated commands, and reset context->batchedCommands/
+ * batchedCount. After the loop they must call
+ * FlushBatchedCommandsToActivatedNodes() to send any remaining partial batch.
+ */
+static void
+SendOrBatchCommandListToActivatedNodes(MetadataSyncContext *context, List *commandList)
+{
+	if (!MetadataSyncBatchingEnabled(context))
+	{
+		SendOrCollectCommandListToActivatedNodes(context, commandList);
+		return;
+	}
+
+	context->batchedCommands = list_concat(context->batchedCommands, commandList);
+	if (++context->batchedCount >= MetadataSyncBatchSize)
+	{
+		SendOrCollectCommandListToActivatedNodes(context, context->batchedCommands);
+		context->batchedCommands = NIL;
+		context->batchedCount = 0;
+		MemoryContextReset(context->batchContext);
+	}
+}
+
+
+/*
+ * FlushBatchedCommandsToActivatedNodes sends any commands accumulated by
+ * SendOrBatchCommandListToActivatedNodes() that were not yet sent because the
+ * final batch did not reach citus.metadata_sync_batch_size distributed objects.
+ * It is a no-op when batching is disabled or the current batch is empty.
+ */
+static void
+FlushBatchedCommandsToActivatedNodes(MetadataSyncContext *context)
+{
+	if (context->batchedCommands == NIL)
+	{
+		return;
+	}
+
+	SendOrCollectCommandListToActivatedNodes(context, context->batchedCommands);
+	context->batchedCommands = NIL;
+	context->batchedCount = 0;
+	MemoryContextReset(context->batchContext);
 }

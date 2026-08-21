@@ -48,6 +48,18 @@ static WaitEventSet * BuildWaitEventSet(MultiConnection **allConnections,
 										int totalConnectionCount,
 										int pendingConnectionsStartIndex);
 
+/*
+ * PipelineCommandErrorState is passed to PipelineCommandErrorCallback so that a
+ * failure while executing a pipelined command can name the exact command that
+ * failed.
+ */
+typedef struct PipelineCommandErrorState
+{
+	const char *command;
+} PipelineCommandErrorState;
+
+static void PipelineCommandErrorCallback(void *arg);
+
 
 /* simple helpers */
 
@@ -573,6 +585,218 @@ SendRemoteCommand(MultiConnection *connection, const char *command)
 	int rc = PQsendQuery(pgConn, command);
 
 	return rc;
+}
+
+
+/*
+ * ExecuteRemoteCommandsInConnectionsInPipelineMode executes the given list of
+ * commands in libpq pipeline mode on each of the given connections.
+ *
+ * This is used by nontransactional metadata sync to push a batch of commands to
+ * a worker with a single network round-trip (one PQpipelineSync) instead of one
+ * round-trip per command, without buffering the whole batch into a single giant
+ * command string on the coordinator.
+ */
+void
+ExecuteRemoteCommandsInConnectionsInPipelineMode(List *connections, List *commands)
+{
+	MultiConnection *connection = NULL;
+	foreach_declared_ptr(connection, connections)
+	{
+		ExecuteRemoteCommandsInPipelineMode(connection, commands);
+	}
+}
+
+
+/*
+ * ExecuteRemoteCommandsInPipelineMode executes the given commands in libpq
+ * pipeline mode on a single connection. Each command is queued as its own
+ * protocol message (no giant StringJoin buffer), and the whole batch is flushed
+ * to the wire in a single PQpipelineSync round-trip.
+ *
+ * libpq pipelining is deadlock-safe here because GetRemoteCommandResult() reads
+ * results via FinishConnectionIO(), which interleaves PQflush() and
+ * PQconsumeInput() while waiting on the socket, so the send buffer keeps
+ * draining while we consume results.
+ *
+ * If a command fails, the error names the exact command string that failed (via
+ * an error context callback), so an operator can pinpoint and re-run an
+ * interrupted nontransactional metadata sync.
+ */
+void
+ExecuteRemoteCommandsInPipelineMode(MultiConnection *connection, List *commands)
+{
+	bool raiseInterrupts = true;
+
+	/*
+	 * Install an error context callback so that any failure below - either while
+	 * queuing a command or while reading its deferred result - names the exact
+	 * command that failed.
+	 */
+	PipelineCommandErrorState commandErrorState = { .command = NULL };
+	ErrorContextCallback errorCallback = {
+		.callback = PipelineCommandErrorCallback,
+		.arg = (void *) &commandErrorState,
+		.previous = error_context_stack
+	};
+	error_context_stack = &errorCallback;
+
+	/* start pipeline mode */
+	if (EnterRemotePipelineMode(connection) != 1)
+	{
+		ReportConnectionError(connection, ERROR);
+	}
+	Assert(PQpipelineStatus(connection->pgConn) == PQ_PIPELINE_ON);
+
+	/* queue every command as its own protocol message */
+	char *command = NULL;
+	foreach_declared_ptr(command, commands)
+	{
+		commandErrorState.command = command;
+		if (SendRemoteCommandParams(connection, command, 0, NULL, NULL, false) == 0)
+		{
+			ReportConnectionError(connection, ERROR);
+		}
+	}
+	commandErrorState.command = NULL;
+
+	/*
+	 * Create a sync point in the pipeline. This flushes the send buffer and
+	 * tells the server we are done with this batch.
+	 */
+	if (SyncRemotePipelineMode(connection) != 1)
+	{
+		ReportConnectionError(connection, ERROR);
+	}
+
+	/*
+	 * Read the deferred results. In pipeline mode libpq returns two results per
+	 * command: the command's own result, followed by a NULL result that marks
+	 * the boundary between commands. A single PGRES_PIPELINE_SYNC result closes
+	 * the batch.
+	 */
+	foreach_declared_ptr(command, commands)
+	{
+		commandErrorState.command = command;
+
+		/* result of the command */
+		PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
+		if (!IsResponseOK(result))
+		{
+			ReportResultError(connection, result, ERROR);
+		}
+		PQclear(result);
+
+		/* NULL result that marks the end of the command */
+		result = GetRemoteCommandResult(connection, raiseInterrupts);
+		if (result != NULL)
+		{
+			ReportResultError(connection, result, ERROR);
+		}
+		PQclear(result);
+	}
+	commandErrorState.command = NULL;
+
+	/* the sync response closes the pipelined batch */
+	PGresult *syncResult = GetRemoteCommandResult(connection, raiseInterrupts);
+	if (PQresultStatus(syncResult) != PGRES_PIPELINE_SYNC)
+	{
+		ReportResultError(connection, syncResult, ERROR);
+	}
+	PQclear(syncResult);
+
+	/* exit pipeline mode */
+	if (ExitRemotePipelineMode(connection) != 1)
+	{
+		ReportConnectionError(connection, ERROR);
+	}
+	Assert(PQpipelineStatus(connection->pgConn) == PQ_PIPELINE_OFF);
+
+	/* pop the error context callback on the success path */
+	error_context_stack = errorCallback.previous;
+}
+
+
+/*
+ * PipelineCommandErrorCallback appends the command currently being processed in
+ * ExecuteRemoteCommandsInPipelineMode() to the error context, so a failing
+ * pipelined command can be identified.
+ */
+static void
+PipelineCommandErrorCallback(void *arg)
+{
+	PipelineCommandErrorState *state = (PipelineCommandErrorState *) arg;
+
+	if (state->command != NULL)
+	{
+		errcontext("while executing metadata sync command: %s", state->command);
+	}
+}
+
+
+/*
+ * EnterRemotePipelineMode puts the given connection into libpq pipeline mode.
+ * Returns the PQenterPipelineMode() return code (1 on success), or 0 if the
+ * connection is not usable.
+ */
+int
+EnterRemotePipelineMode(MultiConnection *connection)
+{
+	PGconn *pgConn = connection->pgConn;
+
+	if (!pgConn || PQstatus(pgConn) != CONNECTION_OK)
+	{
+		return 0;
+	}
+
+	Assert(PQisnonblocking(pgConn));
+	Assert(PQpipelineStatus(pgConn) == PQ_PIPELINE_OFF);
+
+	return PQenterPipelineMode(pgConn);
+}
+
+
+/*
+ * SyncRemotePipelineMode establishes a synchronization point in the pipeline of
+ * the given connection and flushes its send buffer. Returns the PQpipelineSync()
+ * return code (1 on success), or 0 if the connection is not usable.
+ */
+int
+SyncRemotePipelineMode(MultiConnection *connection)
+{
+	PGconn *pgConn = connection->pgConn;
+
+	if (!pgConn || PQstatus(pgConn) != CONNECTION_OK)
+	{
+		return 0;
+	}
+
+	Assert(PQisnonblocking(pgConn));
+	Assert(PQpipelineStatus(pgConn) == PQ_PIPELINE_ON);
+
+	return PQpipelineSync(pgConn);
+}
+
+
+/*
+ * ExitRemotePipelineMode takes the given connection out of libpq pipeline mode.
+ * Returns the PQexitPipelineMode() return code (1 on success), or 0 if the
+ * connection is not usable.
+ */
+int
+ExitRemotePipelineMode(MultiConnection *connection)
+{
+	PGconn *pgConn = connection->pgConn;
+
+	if (!pgConn || PQstatus(pgConn) != CONNECTION_OK)
+	{
+		return 0;
+	}
+
+	Assert(PQisnonblocking(pgConn));
+	Assert(PQpipelineStatus(pgConn) == PQ_PIPELINE_ON);
+
+	return PQexitPipelineMode(pgConn);
 }
 
 

@@ -54,6 +54,13 @@ extern int ExecuteOptionalRemoteCommand(MultiConnection *connection,
 										const char *command,
 										PGresult **result);
 extern int SendRemoteCommand(MultiConnection *connection, const char *command);
+extern int EnterRemotePipelineMode(MultiConnection *connection);
+extern int SyncRemotePipelineMode(MultiConnection *connection);
+extern int ExitRemotePipelineMode(MultiConnection *connection);
+extern void ExecuteRemoteCommandsInPipelineMode(MultiConnection *connection,
+												List *commands);
+extern void ExecuteRemoteCommandsInConnectionsInPipelineMode(List *connections,
+															 List *commands);
 extern int SendRemoteCommandParams(MultiConnection *connection, const char *command,
 								   int parameterCount, const Oid *parameterTypes,
 								   const char *const *parameterValues,
