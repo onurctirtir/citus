@@ -596,6 +596,65 @@ GetExplicitStatisticsCommandList(Oid relationId)
 
 
 /*
+ * GetExplicitStatisticsDropIfExistsCommandList returns a list of
+ * "DROP STATISTICS IF EXISTS" TableDDLCommands, one for each extended statistics
+ * object defined on the table with relationId. It is used while creating a shell
+ * table on a remote node to make the subsequent CREATE STATISTICS commands
+ * (emitted by GetExplicitStatisticsCommandList) idempotent: an orphan shell table
+ * left by an interrupted metadata sync can carry a statistics object whose name
+ * collides with the one recreated here, because extended statistics names live in
+ * a per-schema namespace shared across tables. See the comment on the drop lists
+ * in GetFullTableCreationCommands (node_protocol.c) for why such an orphan cannot
+ * be removed by the activation shell-deletion phase or by
+ * stop_metadata_sync_to_node(.., clear_metadata=>true).
+ */
+List *
+GetExplicitStatisticsDropIfExistsCommandList(Oid relationId)
+{
+	List *dropStatisticsCommandList = NIL;
+
+	Relation relation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(relation))
+	{
+		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
+	}
+
+	List *statisticsIdList = RelationGetStatExtList(relation);
+	RelationClose(relation);
+
+	Oid statisticsId = InvalidOid;
+	foreach_declared_oid(statisticsId, statisticsIdList)
+	{
+		HeapTuple heapTuple = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(statisticsId));
+		if (!HeapTupleIsValid(heapTuple))
+		{
+			ereport(ERROR, (errmsg("cache lookup failed for statistics "
+								   "object with oid %u", statisticsId)));
+		}
+
+		FormData_pg_statistic_ext *statisticsForm =
+			(FormData_pg_statistic_ext *) GETSTRUCT(heapTuple);
+
+		/* build a fully-qualified name so it is independent of the search_path */
+		char *schemaName = get_namespace_name(statisticsForm->stxnamespace);
+		char *statisticsName = NameStr(statisticsForm->stxname);
+		char *qualifiedName = quote_qualified_identifier(schemaName, statisticsName);
+
+		ReleaseSysCache(heapTuple);
+
+		StringInfo dropCommand = makeStringInfo();
+		appendStringInfo(dropCommand, "DROP STATISTICS IF EXISTS %s", qualifiedName);
+
+		dropStatisticsCommandList =
+			lappend(dropStatisticsCommandList,
+					makeTableDDLCommandString(dropCommand->data));
+	}
+
+	return dropStatisticsCommandList;
+}
+
+
+/*
  * GetExplicitStatisticsSchemaIdList returns the list of schema ids of statistics'
  * which are created on relation with given relation id.
  */
