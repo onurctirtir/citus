@@ -5462,7 +5462,7 @@ SendOrBatchCommandListToActivatedNodes(MetadataSyncContext *context, List *comma
 	MemoryContext oldContext = MemoryContextSwitchTo(context->batchedCommandsContext);
 
 	char *command = NULL;
-	foreach_declared_ptr(command, commandList)
+	foreach_ptr(command, commandList)
 	{
 		context->batchedCommands = lappend(context->batchedCommands, pstrdup(command));
 	}

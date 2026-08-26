@@ -661,7 +661,7 @@ ExecuteRemoteCommandsInConnectionsInPipelineMode(List *connections, List *comman
 	 * commands concurrently.
 	 */
 	MultiConnection *connection = NULL;
-	foreach_declared_ptr(connection, connections)
+	foreach_ptr(connection, connections)
 	{
 		SendCommandsToConnectionInPipelineMode(connection, commands,
 											   &commandErrorState);
@@ -671,7 +671,7 @@ ExecuteRemoteCommandsInConnectionsInPipelineMode(List *connections, List *comman
 	 * Drain the deferred results from every connection and take each one
 	 * back out of pipeline mode.
 	 */
-	foreach_declared_ptr(connection, connections)
+	foreach_ptr(connection, connections)
 	{
 		ReceiveResultsFromConnectionInPipelineMode(connection, commands,
 												   &commandErrorState);
@@ -727,7 +727,7 @@ SendCommandsToConnectionInPipelineMode(MultiConnection *connection, List *comman
 	 * "cannot insert multiple commands into a prepared statement".
 	 */
 	char *command = NULL;
-	foreach_declared_ptr(command, commands)
+	foreach_ptr(command, commands)
 	{
 		CHECK_FOR_INTERRUPTS();
 
@@ -784,7 +784,7 @@ ReceiveResultsFromConnectionInPipelineMode(MultiConnection *connection, List *co
 	 * documented contract instead of assuming a fixed count.
 	 */
 	char *command = NULL;
-	foreach_declared_ptr(command, commands)
+	foreach_ptr(command, commands)
 	{
 		commandErrorState->command = command;
 
