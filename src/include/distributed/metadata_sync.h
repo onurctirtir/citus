@@ -222,7 +222,9 @@ extern void SendDependencyCreationCommands(MetadataSyncContext *context);
 extern void SendShellTableCreationCommandsViaPool(MetadataSyncContext *context);
 extern void SendSequenceCreationCommandsViaPool(MetadataSyncContext *context);
 extern void SendDistTableMetadataCommands(MetadataSyncContext *context);
+extern void SendDistTableMetadataCommandsViaPool(MetadataSyncContext *context);
 extern void SendDistObjectCommands(MetadataSyncContext *context);
+extern void SendDistObjectCommandsViaPool(MetadataSyncContext *context);
 extern void SendInterTableRelationshipCommands(MetadataSyncContext *context);
 
 #define DELETE_ALL_NODES "DELETE FROM pg_dist_node"
