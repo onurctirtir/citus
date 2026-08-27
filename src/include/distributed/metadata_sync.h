@@ -48,6 +48,22 @@ typedef struct MetadataSyncContext
 	bool nodesAddedInSameTransaction; /* if the nodes are added just before activation */
 
 	/*
+	 * Object addresses (views, materialized views, publications) that depend on
+	 * Citus shell tables and therefore must be (re)created AFTER the shell table
+	 * phase. Populated by SendDependencyCreationCommands() only when the shell
+	 * table pool path is enabled -- in that path shell tables are deferred out of
+	 * the dependency order and created later in parallel, so any object whose DDL
+	 * references a shell table (e.g. CREATE VIEW ... FROM t, CREATE PUBLICATION
+	 * ... FOR TABLE t) would fail if emitted in the normal dependency phase.
+	 * These are drained by SendDeferredDependentCreationCommands() after the
+	 * shell tables exist. Collected in dependency order so relative ordering
+	 * among the deferred objects (e.g. a view over a view) is preserved.
+	 * Allocated in TopTransactionContext so they survive the per-step resets of
+	 * context->context; freed when the local sync transaction ends.
+	 */
+	List *deferredDependentObjectAddresses;
+
+	/*
 	 * Batch state used by SendOrBatchCommandListToActivatedNodes(). While
 	 * batching, the commands of several distributed objects are accumulated in
 	 * batchedCommands and flushed to the activated nodes together once batchedCount
@@ -204,6 +220,7 @@ extern void SendColocationMetadataCommands(MetadataSyncContext *context);
 extern void SendTenantSchemaMetadataCommands(MetadataSyncContext *context);
 extern void SendDependencyCreationCommands(MetadataSyncContext *context);
 extern void SendShellTableCreationCommandsViaPool(MetadataSyncContext *context);
+extern void SendSequenceCreationCommandsViaPool(MetadataSyncContext *context);
 extern void SendDistTableMetadataCommands(MetadataSyncContext *context);
 extern void SendDistObjectCommands(MetadataSyncContext *context);
 extern void SendInterTableRelationshipCommands(MetadataSyncContext *context);

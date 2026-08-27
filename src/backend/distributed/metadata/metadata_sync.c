@@ -142,10 +142,14 @@ static void AddTableToPublications(Oid relationId);
 static NodeMetadataSyncResult SyncNodeMetadataToNodesOptional(void);
 static bool MetadataSyncShellTablePoolEnabled(MetadataSyncContext *context);
 static bool IsCitusShellTableDependency(const ObjectAddress *dependency);
+static bool IsDependentOnShellTableObject(const ObjectAddress *dependency);
+static void SendDeferredDependentCreationCommands(MetadataSyncContext *context);
 static void SendShellTableCreationCommandsToNodeViaPool(MetadataSyncContext *context,
 														WorkerNode *workerNode);
-static List * CreateShellTableCreationTaskList(List *commandStringList,
-											   WorkerNode *workerNode);
+static void SendSequenceCreationCommandsToNodeViaPool(MetadataSyncContext *context,
+													  WorkerNode *workerNode);
+static List * CreateNodeTargetedPoolTaskList(List *commandStringList,
+											 WorkerNode *workerNode);
 static bool ShouldSyncTableMetadataInternal(bool hashDistributed,
 											bool citusTableWithNoDistKey);
 static bool SyncNodeMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError);
@@ -4807,17 +4811,42 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	SendDependencyCreationCommands(context);
 
 	/*
+	 * When the pool path is enabled, SendDependencyCreationCommands above also
+	 * skips the distributed sequences; (re)create them here in parallel over a
+	 * pool of connections, before the shell tables so each shell table's column
+	 * defaults can be re-associated with an already-created sequence. Sequences
+	 * are an embarrassingly parallel leaf class (no intra-class edges) whose
+	 * upward dependencies (roles, schemas) were just created above, so the phase
+	 * barrier holds.
+	 */
+	if (MetadataSyncShellTablePoolEnabled(context))
+	{
+		SendSequenceCreationCommandsViaPool(context);
+	}
+
+	/*
 	 * When the pool path is enabled, SendDependencyCreationCommands above skips
 	 * the Citus shell tables and we (re)create them here in parallel over a pool
 	 * of connections to each activated node. Shell tables have no dependencies
 	 * on each other, so they are embarrassingly parallel; all of their upward
 	 * dependencies (roles, schemas, types, functions, sequences, ...) were just
-	 * created by SendDependencyCreationCommands, so the phase barrier holds.
+	 * created by SendDependencyCreationCommands and the sequence pool phase, so
+	 * the phase barrier holds.
 	 */
 	if (MetadataSyncShellTablePoolEnabled(context))
 	{
 		SendShellTableCreationCommandsViaPool(context);
 	}
+
+	/*
+	 * (Re)create the objects that depend on shell tables (views, materialized
+	 * views, publications) which SendDependencyCreationCommands deferred because
+	 * their target shell tables were just created above in the pool phase. This
+	 * matches the stock dependency order (these objects come after their tables
+	 * and before the per-table metadata below). In the serial path the deferred
+	 * list is empty, so this is a no-op.
+	 */
+	SendDeferredDependentCreationCommands(context);
 
 	SendDistTableMetadataCommands(context);
 	SendDistObjectCommands(context);
@@ -5066,8 +5095,30 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 
+	/*
+	 * When the pool path is enabled, Citus shell tables AND distributed
+	 * sequences are created later over pools of parallel connections
+	 * (SendSequenceCreationCommandsViaPool() then
+	 * SendShellTableCreationCommandsViaPool()). Exclude both from the dependency
+	 * list *at scan time* so the millions of shell tables and sequences on a
+	 * large cluster are never materialized here, never filtered, and --
+	 * crucially -- never fed into the per-object pg_depend traversal in
+	 * OrderObjectAddressListInDependencyOrder() below, whose cost and peak
+	 * memory would otherwise be proportional to the number of distributed
+	 * tables/sequences and dominate sync wall time on the single coordinator
+	 * backend. Both classes are embarrassingly parallel (no intra-class edges),
+	 * so no dependency ordering is lost by removing them from this phase.
+	 */
+	bool poolShellTables = MetadataSyncShellTablePoolEnabled(context);
+
 	/* collect all dependencies in creation order and get their ddl commands */
-	List *dependencies = GetDistributedObjectAddressList();
+	instr_time prePhaseStart;
+	INSTR_TIME_SET_CURRENT(prePhaseStart);
+	List *dependencies = poolShellTables ?
+						 GetDistributedObjectAddressListWithoutShellTablesAndSequences() :
+						 GetDistributedObjectAddressList();
+	instr_time afterScan;
+	INSTR_TIME_SET_CURRENT(afterScan);
 
 	/*
 	 * Depending on changes in the environment, such as the enable_metadata_sync guc
@@ -5077,8 +5128,29 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 	dependencies = FilterObjectAddressListByPredicate(dependencies,
 													  &SupportedDependencyByCitus,
 													  true);
+	instr_time afterFilter;
+	INSTR_TIME_SET_CURRENT(afterFilter);
 
 	dependencies = OrderObjectAddressListInDependencyOrder(dependencies, true);
+	instr_time afterOrder;
+	INSTR_TIME_SET_CURRENT(afterOrder);
+
+	{
+		instr_time scanDur = afterScan;
+		instr_time filterDur = afterFilter;
+		instr_time orderDur = afterOrder;
+		INSTR_TIME_SUBTRACT(scanDur, prePhaseStart);
+		INSTR_TIME_SUBTRACT(filterDur, afterScan);
+		INSTR_TIME_SUBTRACT(orderDur, afterFilter);
+		ereport(LOG, (errmsg("BENCH dependency pre-phase (poolShellTables=%d): "
+							 "scan %.1f ms, filter %.1f ms, order %.1f ms, "
+							 "dependencies=%d",
+							 poolShellTables,
+							 INSTR_TIME_GET_MILLISEC(scanDur),
+							 INSTR_TIME_GET_MILLISEC(filterDur),
+							 INSTR_TIME_GET_MILLISEC(orderDur),
+							 list_length(dependencies))));
+	}
 
 	/*
 	 * commandsContext holds the batched command strings until they are flushed.
@@ -5100,7 +5172,6 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 														   ALLOCSET_DEFAULT_SIZES);
 	ObjectAddress *dependency = NULL;
 	int64 processedCount = 0;
-	bool poolShellTables = MetadataSyncShellTablePoolEnabled(context);
 	InitializeActivatedNodeCommandBatch(context, commandsContext);
 	foreach_ptr(dependency, dependencies)
 	{
@@ -5116,6 +5187,29 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 		 */
 		if (poolShellTables && IsCitusShellTableDependency(dependency))
 		{
+			FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+			continue;
+		}
+
+		/*
+		 * When the pool path is enabled, objects that DEPEND ON a Citus shell
+		 * table (views/materialized views over a distributed table, and
+		 * publications created FOR TABLE a distributed table) cannot be created
+		 * here: their target shell tables are deferred to the later parallel
+		 * phase, so emitting e.g. "CREATE VIEW v AS SELECT ... FROM t" or
+		 * "CREATE PUBLICATION p FOR TABLE t" now would fail with "relation t
+		 * does not exist". Stash them (in dependency order) and (re)create them
+		 * in SendDeferredDependentCreationCommands() once the shell tables exist.
+		 */
+		if (poolShellTables && IsDependentOnShellTableObject(dependency))
+		{
+			MemoryContext stashContext = MemoryContextSwitchTo(TopTransactionContext);
+			ObjectAddress *deferredAddress = palloc0(sizeof(ObjectAddress));
+			*deferredAddress = *dependency;
+			context->deferredDependentObjectAddresses =
+				lappend(context->deferredDependentObjectAddresses, deferredAddress);
+			MemoryContextSwitchTo(stashContext);
+
 			FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
 			continue;
 		}
@@ -5350,8 +5444,8 @@ SendShellTableCreationCommandsToNodeViaPool(MetadataSyncContext *context,
 		bool waveFull = (list_length(waveTaskCommandLists) >= tasksPerWave);
 		if (waveTaskCommandLists != NIL && (waveFull || scanDone))
 		{
-			List *taskList = CreateShellTableCreationTaskList(waveTaskCommandLists,
-															  workerNode);
+			List *taskList = CreateNodeTargetedPoolTaskList(waveTaskCommandLists,
+															workerNode);
 
 			instr_time deparseEnd;
 			INSTR_TIME_SET_CURRENT(deparseEnd);
@@ -5401,15 +5495,241 @@ SendShellTableCreationCommandsToNodeViaPool(MetadataSyncContext *context,
 
 
 /*
- * CreateShellTableCreationTaskList builds one DDL_TASK per per-task command
- * list in commandListPerTask, each targeting the single (shardless) placement
- * on workerNode. This mirrors ConvertNonExistingPlacementDDLCommandsToTasks()
- * but takes the WorkerNode directly, since the caller already has it, and
- * attaches the commands as a query string list so the adaptive executor runs
- * (and accounts for) them one statement at a time.
+ * SendSequenceCreationCommandsViaPool creates the distributed sequences on all
+ * activated nodes using a pool of parallel connections, mirroring
+ * SendShellTableCreationCommandsViaPool.
+ *
+ * It runs AFTER SendDependencyCreationCommands() (so the roles/schemas the
+ * sequences depend on already exist) and BEFORE
+ * SendShellTableCreationCommandsViaPool() (so each shell table can re-associate
+ * its column defaults with the already-created sequences). Distributed
+ * sequences form an embarrassingly parallel leaf class -- they have no
+ * intra-class edges and only ever depend "upward" on the small prerequisite set
+ * -- so, like shell tables, they are excluded from the serial dependency
+ * ordering phase and (re)created here in parallel instead.
+ */
+void
+SendSequenceCreationCommandsViaPool(MetadataSyncContext *context)
+{
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, context->activatedWorkerNodeList)
+	{
+		SendSequenceCreationCommandsToNodeViaPool(context, workerNode);
+	}
+}
+
+
+/*
+ * SendSequenceCreationCommandsToNodeViaPool creates the distributed sequences on
+ * a single activated node using a pool of parallel connections.
+ *
+ * Sequences live only in pg_dist_object (there is no dedicated catalog), so this
+ * scans pg_dist_object and selects the rows describing distributed sequences via
+ * the same predicate (IsPgDistObjectRowDistributedSequence) that excludes them
+ * from the serial dependency ordering phase -- keeping the "excluded there ==
+ * created here" invariant in one place. Non-sequence rows (shell tables, types,
+ * ...) are simply skipped. Scanning pg_dist_object streaming-style, rather than
+ * materializing a filtered sequence list, keeps peak memory bounded on clusters
+ * with millions of distributed sequences.
+ *
+ * Work is chunked into waves exactly like the shell table phase: batch_size
+ * sequences' CREATE bundles per executor task, pool_size tasks per blocking
+ * wave, wave memory reset between waves. Peak memory is ~one wave.
+ */
+static void
+SendSequenceCreationCommandsToNodeViaPool(MetadataSyncContext *context,
+										  WorkerNode *workerNode)
+{
+	int poolSize = MaxAdaptiveExecutorPoolSize;
+	if (poolSize < 1)
+	{
+		poolSize = 1;
+	}
+
+	/* number of sequences whose CREATE DDL is bundled into one executor task */
+	int sequencesPerTask = MetadataSyncBatchSize;
+
+	/* number of tasks dispatched together in one blocking executor call (a wave) */
+	int tasksPerWave = poolSize;
+
+	Relation relation = table_open(DistObjectRelationId(), AccessShareLock);
+	SysScanDesc scanDesc = systable_beginscan(relation, InvalidOid, false, NULL, 0, NULL);
+
+	MemoryContext oldContext = CurrentMemoryContext;
+
+	/*
+	 * perSequenceContext holds the transient deparse/catalog scratch for a single
+	 * sequence's CREATE bundle; it is reset after each sequence. waveContext holds
+	 * the current wave's task query strings and Task structs; it is reset after
+	 * the wave executes. Peak memory is bounded to one wave.
+	 */
+	MemoryContext perSequenceContext =
+		AllocSetContextCreate(oldContext, "sequence pool per sequence context",
+							  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext waveContext =
+		AllocSetContextCreate(oldContext, "sequence pool wave context",
+							  ALLOCSET_DEFAULT_SIZES);
+
+	/* timing harness: coordinator deparse vs worker execute, as in the shell phase */
+	instr_time deparseTime;
+	instr_time executeTime;
+	INSTR_TIME_SET_ZERO(deparseTime);
+	INSTR_TIME_SET_ZERO(executeTime);
+
+	int64 sequenceCount = 0;
+	int64 waveCount = 0;
+	int64 processedCount = 0;
+
+	List *waveTaskCommandLists = NIL;
+	List *taskCommandList = NIL;
+	int sequencesInTask = 0;
+
+	instr_time deparseStart;
+	INSTR_TIME_SET_CURRENT(deparseStart);
+
+	while (true)
+	{
+		HeapTuple heapTuple = systable_getnext(scanDesc);
+		bool scanDone = !HeapTupleIsValid(heapTuple);
+
+		if (!scanDone)
+		{
+			Form_pg_dist_object pg_dist_object =
+				(Form_pg_dist_object) GETSTRUCT(heapTuple);
+			Oid classId = pg_dist_object->classid;
+			Oid objId = pg_dist_object->objid;
+
+			if (IsPgDistObjectRowDistributedSequence(classId, objId))
+			{
+				MemoryContextSwitchTo(perSequenceContext);
+
+				/*
+				 * Extension-owned sequences are created together with their
+				 * extension, so skip them here just like the serial dependency
+				 * emit path does.
+				 */
+				ObjectAddress seqAddress = { 0 };
+				ObjectAddressSet(seqAddress, RelationRelationId, objId);
+				bool ownedByExtension =
+					IsAnyObjectAddressOwnedByExtension(list_make1(&seqAddress), NULL);
+
+				if (!ownedByExtension)
+				{
+					List *sequenceCommands =
+						DDLCommandsForSequence(objId, TableOwner(objId));
+
+					MemoryContextSwitchTo(waveContext);
+
+					if (taskCommandList == NIL)
+					{
+						/*
+						 * Disable DDL propagation on the worker backend so the
+						 * sequence CREATEs are not re-propagated; attach as a
+						 * query string list (one statement per element) so the
+						 * adaptive executor's per-query result bookkeeping stays
+						 * in sync -- worker_apply_sequence_command() is a
+						 * row-returning SELECT.
+						 */
+						taskCommandList =
+							list_make1(pstrdup(DISABLE_DDL_PROPAGATION));
+					}
+
+					char *command = NULL;
+					foreach_ptr(command, sequenceCommands)
+					{
+						taskCommandList = lappend(taskCommandList, pstrdup(command));
+					}
+
+					sequencesInTask++;
+					sequenceCount++;
+				}
+
+				MemoryContextSwitchTo(waveContext);
+				MemoryContextReset(perSequenceContext);
+
+				/* bound coordinator cache growth as the other scan loops do */
+				FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+			}
+		}
+
+		MemoryContextSwitchTo(waveContext);
+
+		/* close off the current task when it is full or the scan is done */
+		bool taskFull = (sequencesInTask >= sequencesPerTask);
+		if (taskCommandList != NIL && (taskFull || scanDone))
+		{
+			waveTaskCommandLists = lappend(waveTaskCommandLists, taskCommandList);
+			taskCommandList = NIL;
+			sequencesInTask = 0;
+		}
+
+		/* dispatch the wave when it is full or the scan is done */
+		bool waveFull = (list_length(waveTaskCommandLists) >= tasksPerWave);
+		if (waveTaskCommandLists != NIL && (waveFull || scanDone))
+		{
+			List *taskList = CreateNodeTargetedPoolTaskList(waveTaskCommandLists,
+															workerNode);
+
+			instr_time deparseEnd;
+			INSTR_TIME_SET_CURRENT(deparseEnd);
+			INSTR_TIME_ACCUM_DIFF(deparseTime, deparseEnd, deparseStart);
+
+			instr_time executeStart;
+			INSTR_TIME_SET_CURRENT(executeStart);
+			ExecuteTaskListOutsideTransaction(ROW_MODIFY_NONE, taskList, poolSize, NIL);
+			instr_time executeEnd;
+			INSTR_TIME_SET_CURRENT(executeEnd);
+			INSTR_TIME_ACCUM_DIFF(executeTime, executeEnd, executeStart);
+
+			waveCount++;
+
+			MemoryContextReset(waveContext);
+			waveTaskCommandLists = NIL;
+			taskCommandList = NIL;
+			sequencesInTask = 0;
+
+			INSTR_TIME_SET_CURRENT(deparseStart);
+		}
+
+		if (scanDone)
+		{
+			break;
+		}
+	}
+
+	MemoryContextSwitchTo(oldContext);
+
+	systable_endscan(scanDesc);
+	table_close(relation, AccessShareLock);
+
+	MemoryContextDelete(perSequenceContext);
+	MemoryContextDelete(waveContext);
+
+	ereport(LOG, (errmsg("parallel sequence creation on node %s:%d completed: "
+						 "%ld sequences in %ld waves (pool size %d, batch size %d); "
+						 "coordinator deparse %.0f ms, worker execute %.0f ms",
+						 workerNode->workerName, workerNode->workerPort,
+						 (long) sequenceCount, (long) waveCount, poolSize,
+						 sequencesPerTask,
+						 INSTR_TIME_GET_MILLISEC(deparseTime),
+						 INSTR_TIME_GET_MILLISEC(executeTime))));
+}
+
+
+/*
+ * CreateNodeTargetedPoolTaskList builds one DDL_TASK per per-task command list
+ * in commandListPerTask, each targeting the single (shardless) placement on
+ * workerNode. This mirrors ConvertNonExistingPlacementDDLCommandsToTasks() but
+ * takes the WorkerNode directly, since the caller already has it, and attaches
+ * the commands as a query string list so the adaptive executor runs (and
+ * accounts for) them one statement at a time.
+ *
+ * It is shared by the metadata sync pool phases (shell tables and sequences):
+ * both dispatch batches of independent, node-targeted DDL over the connection
+ * pool in exactly this shape.
  */
 static List *
-CreateShellTableCreationTaskList(List *commandListPerTask, WorkerNode *workerNode)
+CreateNodeTargetedPoolTaskList(List *commandListPerTask, WorkerNode *workerNode)
 {
 	List *taskList = NIL;
 	int taskId = 1;
@@ -5476,6 +5796,131 @@ IsCitusShellTableDependency(const ObjectAddress *dependency)
 	}
 
 	return IsCitusTable(dependency->objectId);
+}
+
+
+/*
+ * IsDependentOnShellTableObject returns true if the given distributed object's
+ * creation DDL references a Citus shell table, and therefore must be created
+ * AFTER the shell table phase when the shell table pool path is enabled.
+ *
+ * These are:
+ *  - views and materialized views (their definition selects from the table), and
+ *  - publications (CREATE PUBLICATION ... FOR TABLE names the specific table).
+ *
+ * In the normal (serial) path these are emitted in dependency order after their
+ * target tables, so no special handling is needed. In the pool path the shell
+ * tables are deferred out of the dependency order, so these objects would be
+ * emitted before their target tables exist; SendDependencyCreationCommands()
+ * stashes them and SendDeferredDependentCreationCommands() (re)creates them once
+ * the shell tables exist.
+ */
+static bool
+IsDependentOnShellTableObject(const ObjectAddress *dependency)
+{
+	if (dependency->classId == PublicationRelationId)
+	{
+		return true;
+	}
+
+	if (getObjectClass(dependency) == OCLASS_CLASS)
+	{
+		char relKind = get_rel_relkind(dependency->objectId);
+		if (relKind == RELKIND_VIEW || relKind == RELKIND_MATVIEW)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * SendDeferredDependentCreationCommands (re)creates the objects that depend on
+ * Citus shell tables (views, materialized views, publications) which
+ * SendDependencyCreationCommands() deferred because their target shell tables
+ * were created later in the parallel pool phase.
+ *
+ * It must be called AFTER SendShellTableCreationCommandsViaPool() so the shell
+ * tables the deferred objects reference already exist, and BEFORE the per-table
+ * metadata commands, matching the position these objects would have in the
+ * stock dependency order. The deferred addresses were collected in dependency
+ * order, so recreating them in list order preserves any relative ordering among
+ * them (e.g. a view built on another view).
+ *
+ * In the serial path the deferred list is empty (nothing was stashed), so this
+ * is a no-op and safe to call unconditionally.
+ */
+static void
+SendDeferredDependentCreationCommands(MetadataSyncContext *context)
+{
+	List *deferredObjectAddresses = context->deferredDependentObjectAddresses;
+	if (deferredObjectAddresses == NIL)
+	{
+		return;
+	}
+
+	/* disable ddl propagation */
+	SendOrCollectCommandListToActivatedNodes(context,
+											 list_make1(DISABLE_DDL_PROPAGATION));
+
+	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
+
+	/*
+	 * commandsContext holds the batched command strings until they are flushed;
+	 * perObjectContext holds each object's deparse scratch and is reset every
+	 * iteration so it does not accumulate.
+	 */
+	MemoryContext commandsContext = AllocSetContextCreate(context->context,
+														  "deferred dependent commands context",
+														  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext perObjectContext = AllocSetContextCreate(oldContext,
+														   "deferred dependent per object context",
+														   ALLOCSET_DEFAULT_SIZES);
+
+	ObjectAddress *dependency = NULL;
+	InitializeActivatedNodeCommandBatch(context, commandsContext);
+	foreach_ptr(dependency, deferredObjectAddresses)
+	{
+		MemoryContextReset(perObjectContext);
+		MemoryContextSwitchTo(perObjectContext);
+
+		/*
+		 * We expect extension-owned objects to be created as a result
+		 * of the extension being created.
+		 */
+		if (!IsAnyObjectAddressOwnedByExtension(list_make1(dependency), NULL))
+		{
+			List *ddlCommands = GetAllDependencyCreateDDLCommands(list_make1(dependency));
+			SendOrBatchCommandListToActivatedNodes(context, ddlCommands);
+		}
+	}
+
+	MemoryContextSwitchTo(context->context);
+
+	/* send whatever remains in the final partial batch */
+	FlushBatchedCommandsToActivatedNodes(context);
+
+	MemoryContextSwitchTo(oldContext);
+
+	MemoryContextDelete(perObjectContext);
+
+	if (!MetadataSyncCollectsCommands(context))
+	{
+		MemoryContextDelete(commandsContext);
+	}
+	ResetMetadataSyncMemoryContext(context);
+
+	/*
+	 * The deferred addresses live in TopTransactionContext; drop our reference
+	 * so a subsequent activation in the same transaction starts clean. The
+	 * memory itself is reclaimed when the local sync transaction ends.
+	 */
+	context->deferredDependentObjectAddresses = NIL;
+
+	/* enable ddl propagation */
+	SendOrCollectCommandListToActivatedNodes(context, list_make1(ENABLE_DDL_PROPAGATION));
 }
 
 
