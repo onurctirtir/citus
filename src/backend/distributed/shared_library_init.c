@@ -2096,6 +2096,21 @@ RegisterCitusConfigVariables(void)
 		GUC_UNIT_MS | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"citus.metadata_sync_use_pool",
+		gettext_noop("Enables creating shell tables over a pool of parallel "
+					 "connections during metadata sync."),
+		gettext_noop("When enabled and metadata sync runs in nontransactional "
+					 "mode, the shell tables of distributed tables are created "
+					 "on each activated node over a pool of parallel connections "
+					 "(sized by citus.max_adaptive_executor_pool_size) instead of "
+					 "the single serial metadata connection. Off by default."),
+		&MetadataSyncUsePool,
+		false,
+		PGC_SUSET,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+
 	/*
 	 * Previously we setting this configuration parameter
 	 * in the fly for failure tests schedule.

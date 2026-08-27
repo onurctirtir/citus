@@ -43,6 +43,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/pg_list.h"
 #include "parser/parse_type.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/postmaster.h"
 #include "storage/lmgr.h"
@@ -54,6 +55,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+#include "distributed/adaptive_executor.h"
 #include "distributed/argutils.h"
 #include "distributed/backend_data.h"
 #include "distributed/citus_ruleutils.h"
@@ -61,6 +63,7 @@
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/coordinator_protocol.h"
+#include "distributed/deparse_shard_query.h"
 #include "distributed/deparser.h"
 #include "distributed/distribution_column.h"
 #include "distributed/listutils.h"
@@ -114,6 +117,18 @@ int MetadataSyncCacheFlushInterval = 1000;
  */
 int MetadataSyncBatchSize = 1000;
 
+/*
+ * MetadataSyncUsePool controls whether the shell table creation step of
+ * metadata sync uses a pool of parallel connections to the activated node
+ * (driven by the adaptive executor) instead of the serial single-connection
+ * path.
+ *
+ * Set via citus.metadata_sync_use_pool; default false (serial path, no behavior
+ * change). Only takes effect in nontransactional mode, where the parallel
+ * connections cannot share one distributed transaction anyway.
+ */
+bool MetadataSyncUsePool = false;
+
 
 static void EnsureObjectMetadataIsSane(int distributionArgumentIndex,
 									   int colocationId);
@@ -125,6 +140,12 @@ static void CreateTableMetadataOnWorkers(Oid relationId);
 static void CreateDependingViewsOnWorkers(Oid relationId);
 static void AddTableToPublications(Oid relationId);
 static NodeMetadataSyncResult SyncNodeMetadataToNodesOptional(void);
+static bool MetadataSyncShellTablePoolEnabled(MetadataSyncContext *context);
+static bool IsCitusShellTableDependency(const ObjectAddress *dependency);
+static void SendShellTableCreationCommandsToNodeViaPool(MetadataSyncContext *context,
+														WorkerNode *workerNode);
+static List * CreateShellTableCreationTaskList(List *commandStringList,
+											   WorkerNode *workerNode);
 static bool ShouldSyncTableMetadataInternal(bool hashDistributed,
 											bool citusTableWithNoDistKey);
 static bool SyncNodeMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError);
@@ -4784,6 +4805,20 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	 * pg_dist_partition, pg_dist_object).
 	 */
 	SendDependencyCreationCommands(context);
+
+	/*
+	 * When the pool path is enabled, SendDependencyCreationCommands above skips
+	 * the Citus shell tables and we (re)create them here in parallel over a pool
+	 * of connections to each activated node. Shell tables have no dependencies
+	 * on each other, so they are embarrassingly parallel; all of their upward
+	 * dependencies (roles, schemas, types, functions, sequences, ...) were just
+	 * created by SendDependencyCreationCommands, so the phase barrier holds.
+	 */
+	if (MetadataSyncShellTablePoolEnabled(context))
+	{
+		SendShellTableCreationCommandsViaPool(context);
+	}
+
 	SendDistTableMetadataCommands(context);
 	SendDistObjectCommands(context);
 
@@ -5065,11 +5100,25 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 														   ALLOCSET_DEFAULT_SIZES);
 	ObjectAddress *dependency = NULL;
 	int64 processedCount = 0;
+	bool poolShellTables = MetadataSyncShellTablePoolEnabled(context);
 	InitializeActivatedNodeCommandBatch(context, commandsContext);
 	foreach_ptr(dependency, dependencies)
 	{
 		MemoryContextReset(perObjectContext);
 		MemoryContextSwitchTo(perObjectContext);
+
+		/*
+		 * When the pool path is enabled, Citus shell tables are created later
+		 * in SendShellTableCreationCommandsViaPool() over a pool of parallel
+		 * connections, so skip them here. They have no intra-class dependencies
+		 * (only upward edges into the prerequisite objects created in this
+		 * step), so deferring them to a later phase preserves creation order.
+		 */
+		if (poolShellTables && IsCitusShellTableDependency(dependency))
+		{
+			FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+			continue;
+		}
 
 		/*
 		 * We expect extension-owned objects to be created as a result
@@ -5108,6 +5157,325 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 
 	/* enable ddl propagation */
 	SendOrCollectCommandListToActivatedNodes(context, list_make1(ENABLE_DDL_PROPAGATION));
+}
+
+
+/*
+ * SendShellTableCreationCommandsViaPool creates the shell tables of all Citus
+ * tables on the activated nodes using a pool of parallel connections per node,
+ * driven by the adaptive executor.
+ *
+ * This is the parallel counterpart of the shell table creation that
+ * SendDependencyCreationCommands() performs serially over the single metadata
+ * connection. It is only reached in nontransactional mode with
+ * citus.metadata_sync_use_pool on (see MetadataSyncShellTablePoolEnabled()).
+ * The prerequisite objects the shell tables depend on (roles, schemas, types,
+ * functions, sequences, ...) were already created serially in
+ * SendDependencyCreationCommands() before this runs, so the barrier ordering is
+ * preserved.
+ */
+void
+SendShellTableCreationCommandsViaPool(MetadataSyncContext *context)
+{
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, context->activatedWorkerNodeList)
+	{
+		SendShellTableCreationCommandsToNodeViaPool(context, workerNode);
+	}
+}
+
+
+/*
+ * SendShellTableCreationCommandsToNodeViaPool creates the shell tables of all
+ * Citus tables on a single activated node using a pool of parallel connections.
+ *
+ * It enumerates the distributed tables directly from pg_dist_partition (like
+ * SendDistTableMetadataCommands does) rather than walking a materialized,
+ * dependency-ordered ObjectAddress list: shell tables have no intra-class edges,
+ * so no ordering is needed here, and avoiding the global ordered list keeps peak
+ * memory bounded on clusters with millions of tables.
+ *
+ * The work is chunked into waves to bound memory: each table's shell command
+ * bundle is concatenated (batch_size tables per executor task), pool_size tasks
+ * are gathered into one wave, the wave is executed (blocking) over pool_size
+ * parallel connections, and its memory is reset before the next wave. Peak
+ * memory is therefore ~one wave, never the whole cluster.
+ */
+static void
+SendShellTableCreationCommandsToNodeViaPool(MetadataSyncContext *context,
+											WorkerNode *workerNode)
+{
+	int poolSize = MaxAdaptiveExecutorPoolSize;
+	if (poolSize < 1)
+	{
+		poolSize = 1;
+	}
+
+	/* number of tables whose shell DDL is concatenated into one executor task */
+	int tablesPerTask = MetadataSyncBatchSize;
+
+	/* number of tasks dispatched together in one blocking executor call (a wave) */
+	int tasksPerWave = poolSize;
+
+	Relation relation = table_open(DistPartitionRelationId(), AccessShareLock);
+	TupleDesc tupleDesc = RelationGetDescr(relation);
+	SysScanDesc scanDesc = systable_beginscan(relation, InvalidOid, false, NULL, 0, NULL);
+
+	MemoryContext oldContext = CurrentMemoryContext;
+
+	/*
+	 * perTableContext holds the transient deparse and catalog scratch for a
+	 * single table's shell command bundle; it is reset after each table.
+	 *
+	 * waveContext holds the concatenated task query strings and the Task structs
+	 * of the current wave; it is reset after the wave is executed. Peak memory is
+	 * bounded to one wave (tasksPerWave * tablesPerTask tables' command strings).
+	 */
+	MemoryContext perTableContext =
+		AllocSetContextCreate(oldContext, "shell table pool per table context",
+							  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext waveContext =
+		AllocSetContextCreate(oldContext, "shell table pool wave context",
+							  ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * Timing harness: separate the coordinator-side deparse cost (building the
+	 * wave's command strings, single-threaded) from the worker-side execution
+	 * cost (running the wave over the connection pool). ExecuteTaskListOutside-
+	 * Transaction blocks per wave, so these do not overlap; comparing them tells
+	 * us whether the worker side is the floor (parallelism helps) or the deparse
+	 * side is (parallelism is capped and we need async double-buffering).
+	 */
+	instr_time deparseTime;
+	instr_time executeTime;
+	INSTR_TIME_SET_ZERO(deparseTime);
+	INSTR_TIME_SET_ZERO(executeTime);
+
+	int64 tableCount = 0;
+	int64 waveCount = 0;
+	int64 processedCount = 0;
+
+	/* list of per-task command lists making up the current wave, in waveContext */
+	List *waveTaskCommandLists = NIL;
+	/* current task's command list (individual statements), in waveContext */
+	List *taskCommandList = NIL;
+	int tablesInTask = 0;
+
+	instr_time deparseStart;
+	INSTR_TIME_SET_CURRENT(deparseStart);
+
+	while (true)
+	{
+		HeapTuple heapTuple = systable_getnext(scanDesc);
+		bool scanDone = !HeapTupleIsValid(heapTuple);
+
+		if (!scanDone)
+		{
+			Oid relationId = FetchRelationIdFromPgPartitionHeapTuple(heapTuple, tupleDesc);
+
+			MemoryContextSwitchTo(perTableContext);
+
+			/*
+			 * Extension-owned tables are expected to be created as a result of
+			 * the extension being created, so skip them here just like the
+			 * serial dependency path does.
+			 */
+			ObjectAddress tableAddress = { 0 };
+			ObjectAddressSet(tableAddress, RelationRelationId, relationId);
+			bool ownedByExtension =
+				IsAnyObjectAddressOwnedByExtension(list_make1(&tableAddress), NULL);
+
+			if (!ownedByExtension)
+			{
+				List *shellCommands = ShellTableCreationCommandList(relationId);
+
+				MemoryContextSwitchTo(waveContext);
+
+				if (taskCommandList == NIL)
+				{
+					/*
+					 * Each task runs as its own implicit transaction on a worker
+					 * backend; disable DDL propagation there so the shell CREATE
+					 * TABLEs are not re-propagated to the other nodes. This SET
+					 * is a session GUC that persists for the rest of the task's
+					 * statements on that connection.
+					 *
+					 * The commands are attached to the task as a query string
+					 * list (one statement per element) rather than a single
+					 * concatenated string: the adaptive executor sends and
+					 * accounts for results one query at a time, so bundling
+					 * several row-returning statements (e.g. the SELECT
+					 * worker_*() metadata calls inside a shell table bundle)
+					 * into one string would desynchronize its per-query result
+					 * bookkeeping (task->queryCount).
+					 */
+					taskCommandList =
+						list_make1(pstrdup(DISABLE_DDL_PROPAGATION));
+				}
+
+				char *command = NULL;
+				foreach_ptr(command, shellCommands)
+				{
+					taskCommandList = lappend(taskCommandList, pstrdup(command));
+				}
+
+				tablesInTask++;
+				tableCount++;
+			}
+
+			MemoryContextSwitchTo(waveContext);
+			MemoryContextReset(perTableContext);
+
+			/*
+			 * ShouldSyncTableMetadata/relcache lookups opened catalog entries to
+			 * reach here, so advance the cache-flush counter like the other
+			 * per-table scan loops do (bounds coordinator relcache growth on
+			 * clusters with millions of tables).
+			 */
+			FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+		}
+
+		MemoryContextSwitchTo(waveContext);
+
+		/* close off the current task when it is full or the scan is done */
+		bool taskFull = (tablesInTask >= tablesPerTask);
+		if (taskCommandList != NIL && (taskFull || scanDone))
+		{
+			waveTaskCommandLists = lappend(waveTaskCommandLists, taskCommandList);
+			taskCommandList = NIL;
+			tablesInTask = 0;
+		}
+
+		/* dispatch the wave when it is full or the scan is done */
+		bool waveFull = (list_length(waveTaskCommandLists) >= tasksPerWave);
+		if (waveTaskCommandLists != NIL && (waveFull || scanDone))
+		{
+			List *taskList = CreateShellTableCreationTaskList(waveTaskCommandLists,
+															  workerNode);
+
+			instr_time deparseEnd;
+			INSTR_TIME_SET_CURRENT(deparseEnd);
+			INSTR_TIME_ACCUM_DIFF(deparseTime, deparseEnd, deparseStart);
+
+			instr_time executeStart;
+			INSTR_TIME_SET_CURRENT(executeStart);
+			ExecuteTaskListOutsideTransaction(ROW_MODIFY_NONE, taskList, poolSize, NIL);
+			instr_time executeEnd;
+			INSTR_TIME_SET_CURRENT(executeEnd);
+			INSTR_TIME_ACCUM_DIFF(executeTime, executeEnd, executeStart);
+
+			waveCount++;
+
+			/* free the wave's task strings and Task structs before the next wave */
+			MemoryContextReset(waveContext);
+			waveTaskCommandLists = NIL;
+			taskCommandList = NIL;
+			tablesInTask = 0;
+
+			/* resume the deparse timer for the next wave */
+			INSTR_TIME_SET_CURRENT(deparseStart);
+		}
+
+		if (scanDone)
+		{
+			break;
+		}
+	}
+
+	MemoryContextSwitchTo(oldContext);
+
+	systable_endscan(scanDesc);
+	table_close(relation, AccessShareLock);
+
+	MemoryContextDelete(perTableContext);
+	MemoryContextDelete(waveContext);
+
+	ereport(LOG, (errmsg("parallel shell table creation on node %s:%d completed: "
+						 "%ld tables in %ld waves (pool size %d, batch size %d); "
+						 "coordinator deparse %.0f ms, worker execute %.0f ms",
+						 workerNode->workerName, workerNode->workerPort,
+						 (long) tableCount, (long) waveCount, poolSize, tablesPerTask,
+						 INSTR_TIME_GET_MILLISEC(deparseTime),
+						 INSTR_TIME_GET_MILLISEC(executeTime))));
+}
+
+
+/*
+ * CreateShellTableCreationTaskList builds one DDL_TASK per per-task command
+ * list in commandListPerTask, each targeting the single (shardless) placement
+ * on workerNode. This mirrors ConvertNonExistingPlacementDDLCommandsToTasks()
+ * but takes the WorkerNode directly, since the caller already has it, and
+ * attaches the commands as a query string list so the adaptive executor runs
+ * (and accounts for) them one statement at a time.
+ */
+static List *
+CreateShellTableCreationTaskList(List *commandListPerTask, WorkerNode *workerNode)
+{
+	List *taskList = NIL;
+	int taskId = 1;
+	List *taskCommandList = NIL;
+	foreach_ptr(taskCommandList, commandListPerTask)
+	{
+		Task *task = CreateBasicTask(INVALID_JOB_ID, taskId, DDL_TASK, NULL);
+		SetTaskQueryStringList(task, taskCommandList);
+
+		/* node-targeted task with a synthetic placement and no real shard */
+		ShardPlacement *taskPlacement = CitusMakeNode(ShardPlacement);
+		SetPlacementNodeMetadata(taskPlacement, workerNode);
+		task->taskPlacementList = list_make1(taskPlacement);
+
+		taskList = lappend(taskList, task);
+		taskId++;
+	}
+
+	return taskList;
+}
+
+
+/*
+ * MetadataSyncShellTablePoolEnabled returns whether the shell table creation
+ * step should use the parallel connection pool path instead of the serial
+ * single-connection path.
+ *
+ * The pool path requires:
+ *   - citus.metadata_sync_use_pool is on;
+ *   - nontransactional mode, because the parallel connections each auto-commit
+ *     their own work and so cannot participate in the single distributed
+ *     transaction used by transactional mode;
+ *   - that we are actually sending commands, not collecting them (the command
+ *     collection path has no target connections to execute over).
+ */
+static bool
+MetadataSyncShellTablePoolEnabled(MetadataSyncContext *context)
+{
+	return MetadataSyncUsePool &&
+		   context->transactionMode == METADATA_SYNC_NON_TRANSACTIONAL &&
+		   !MetadataSyncCollectsCommands(context);
+}
+
+
+/*
+ * IsCitusShellTableDependency returns true if the given distributed object is a
+ * Citus table relation whose shell table is (re)created during metadata sync.
+ * This matches exactly the branch in GetDependencyCreateDDLCommands() that emits
+ * the shell table bundle (see ShellTableCreationCommandList()).
+ */
+static bool
+IsCitusShellTableDependency(const ObjectAddress *dependency)
+{
+	if (getObjectClass(dependency) != OCLASS_CLASS)
+	{
+		return false;
+	}
+
+	char relKind = get_rel_relkind(dependency->objectId);
+	if (relKind != RELKIND_RELATION && relKind != RELKIND_PARTITIONED_TABLE &&
+		relKind != RELKIND_FOREIGN_TABLE)
+	{
+		return false;
+	}
+
+	return IsCitusTable(dependency->objectId);
 }
 
 

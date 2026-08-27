@@ -32,6 +32,7 @@ extern int MetadataSyncRetryInterval;
 extern int MetadataSyncTransMode;
 extern int MetadataSyncCacheFlushInterval;
 extern int MetadataSyncBatchSize;
+extern bool MetadataSyncUsePool;
 
 /*
  * MetadataSyncContext is used throughout metadata sync.
@@ -193,6 +194,7 @@ extern void ActivateNodeList(MetadataSyncContext *context);
 
 extern char * WorkerDropAllShellTablesCommand(bool singleTransaction);
 extern char * WorkerDropSequenceDependencyCommand(Oid relationId);
+extern List * ShellTableCreationCommandList(Oid relationId);
 
 extern void SyncDistributedObjects(MetadataSyncContext *context);
 extern void SendNodeWideObjectsSyncCommands(MetadataSyncContext *context);
@@ -201,6 +203,7 @@ extern void SendMetadataDeletionCommands(MetadataSyncContext *context);
 extern void SendColocationMetadataCommands(MetadataSyncContext *context);
 extern void SendTenantSchemaMetadataCommands(MetadataSyncContext *context);
 extern void SendDependencyCreationCommands(MetadataSyncContext *context);
+extern void SendShellTableCreationCommandsViaPool(MetadataSyncContext *context);
 extern void SendDistTableMetadataCommands(MetadataSyncContext *context);
 extern void SendDistObjectCommands(MetadataSyncContext *context);
 extern void SendInterTableRelationshipCommands(MetadataSyncContext *context);
