@@ -109,14 +109,19 @@ int MetadataSyncTransMode = METADATA_SYNC_TRANSACTIONAL;
 int MetadataSyncCacheFlushInterval = 1000;
 
 /*
- * MetadataSyncBatchSize is the number of distributed objects whose
- * metadata-sync commands we accumulate and send to the activated nodes in a single
- * round-trip while syncing metadata to a node.
+ * MetadataSyncPoolTaskSize is the number of distributed objects whose creation
+ * commands we pack into a single pool task when the metadata-sync connection pool
+ * is enabled (citus.metadata_sync_use_pool). Set via
+ * citus.metadata_sync_pool_task_size.
  *
- * Set via citus.metadata_sync_batch_size; 1 disables batching and restores the
- * one-object-per-round-trip behavior.
+ * MetadataSyncSetBatchSize is the number of distributed objects whose per-object
+ * metadata rows (pg_dist_partition / pg_dist_shard / pg_dist_placement /
+ * pg_dist_object) we fold into a single set-based citus_internal_add_*_metadata
+ * statement on the serial metadata connection. Set via
+ * citus.metadata_sync_set_batch_size; 1 restores one statement per object.
  */
-int MetadataSyncBatchSize = 1000;
+int MetadataSyncPoolTaskSize = 1000;
+int MetadataSyncSetBatchSize = 1000;
 
 /*
  * MetadataSyncUsePool controls whether the shell table creation step of
@@ -5065,7 +5070,7 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	 * saturate a worker backend. What actually dominated these layers was the
 	 * per-object round-trip and remote commit, and the serial senders remove that
 	 * by set-batching: SendDistTableMetadataCommands and SendDistObjectCommands
-	 * accumulate up to citus.metadata_sync_batch_size objects and emit a few
+	 * accumulate up to citus.metadata_sync_set_batch_size objects and emit a few
 	 * set-based statements per batch (one citus_internal_add_partition_metadata /
 	 * add_shard_metadata / add_placement_metadata over a VALUES list, and one
 	 * citus_internal_add_object_metadata over a VALUES list), each sent as one
@@ -5480,7 +5485,7 @@ RunNodeTargetedPoolPhase(MetadataSyncContext *context, WorkerNode *workerNode,
 	}
 
 	/* number of objects whose commands are bundled into one executor task */
-	int objectsPerTask = MetadataSyncBatchSize;
+	int objectsPerTask = MetadataSyncPoolTaskSize;
 
 	/* number of tasks dispatched together in one blocking executor call (a wave) */
 	int tasksPerWave = poolSize;
@@ -6208,7 +6213,7 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 
 	/*
-	 * Accumulate up to metadata_sync_batch_size relations and emit their
+	 * Accumulate up to metadata_sync_set_batch_size relations and emit their
 	 * pg_dist_partition / pg_dist_shard / pg_dist_placement entries as a few
 	 * set-based statements (one citus_internal_add_partition_metadata, one
 	 * citus_internal_add_shard_metadata, one citus_internal_add_placement_metadata
@@ -6228,7 +6233,7 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 	 * the shard's pg_dist_shard entry to already exist.
 	 */
 	bool collecting = MetadataSyncCollectsCommands(context);
-	int batchSize = Max(MetadataSyncBatchSize, 1);
+	int batchSize = Max(MetadataSyncSetBatchSize, 1);
 	MemoryContext batchContext = AllocSetContextCreate(oldContext,
 													   "dist table metadata batch context",
 													   ALLOCSET_DEFAULT_SIZES);
@@ -6593,7 +6598,7 @@ SendDistObjectCommands(MetadataSyncContext *context)
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 
 	/*
-	 * Accumulate up to metadata_sync_batch_size objects and emit their
+	 * Accumulate up to metadata_sync_set_batch_size objects and emit their
 	 * pg_dist_object rows as a single set-based citus_internal_add_object_metadata
 	 * statement (MarkObjectsDistributedCreateCommand already builds one VALUES
 	 * command for a whole list of objects), instead of one statement and one
@@ -6611,7 +6616,7 @@ SendDistObjectCommands(MetadataSyncContext *context)
 	 * long-lived context so it survives the batch reset.
 	 */
 	bool collecting = MetadataSyncCollectsCommands(context);
-	int batchSize = Max(MetadataSyncBatchSize, 1);
+	int batchSize = Max(MetadataSyncSetBatchSize, 1);
 	MemoryContext batchContext = AllocSetContextCreate(oldContext,
 													   "dist object commands batch context",
 													   ALLOCSET_DEFAULT_SIZES);

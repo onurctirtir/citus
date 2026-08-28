@@ -2017,28 +2017,6 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
-		"citus.metadata_sync_batch_size",
-		gettext_noop("Sets the number of distributed objects grouped into a single "
-					 "parallel metadata-sync task."),
-		gettext_noop("When citus.metadata_sync_use_pool is enabled, Citus spreads "
-					 "the shell-table and metadata creation work for a node being "
-					 "activated across a pool of connections (sized by "
-					 "citus.max_adaptive_executor_pool_size). This setting controls "
-					 "how many distributed objects' commands are packed into each "
-					 "task handed to a pool connection. Larger values mean fewer, "
-					 "bigger tasks (each running in one remote transaction that holds "
-					 "the objects' creation locks until it commits, so a very large "
-					 "value can exhaust the remote node's shared lock table, sized by "
-					 "max_locks_per_transaction); smaller values give finer-grained "
-					 "load balancing across the pool. It has no effect when the pool "
-					 "is disabled."),
-		&MetadataSyncBatchSize,
-		1000, 1, 10000,
-		PGC_SUSET,
-		GUC_NOT_IN_SAMPLE,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
 		"citus.metadata_sync_cache_flush_interval",
 		gettext_noop("Sets the number of distributed objects processed between "
 					 "backend cache flushes while syncing metadata to a node."),
@@ -2098,6 +2076,28 @@ RegisterCitusConfigVariables(void)
 		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 
+	DefineCustomIntVariable(
+		"citus.metadata_sync_pool_task_size",
+		gettext_noop("Sets the number of distributed objects grouped into a single "
+					 "parallel metadata-sync pool task."),
+		gettext_noop("When citus.metadata_sync_use_pool is enabled, Citus spreads "
+					 "the shell-table and sequence creation work for a node being "
+					 "activated across a pool of connections (sized by "
+					 "citus.max_adaptive_executor_pool_size). This setting controls "
+					 "how many distributed objects' commands are packed into each "
+					 "task handed to a pool connection. Larger values mean fewer, "
+					 "bigger tasks (each running in one remote transaction that holds "
+					 "the objects' creation locks until it commits, so a very large "
+					 "value can exhaust the remote node's shared lock table, sized by "
+					 "max_locks_per_transaction); smaller values give finer-grained "
+					 "load balancing across the pool. It has no effect when the pool "
+					 "is disabled."),
+		&MetadataSyncPoolTaskSize,
+		1000, 1, 10000,
+		PGC_SUSET,
+		GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+
 	DefineCustomBoolVariable(
 		"citus.metadata_sync_release_deparse_locks",
 		gettext_noop("Releases per-object catalog locks during pooled metadata "
@@ -2126,6 +2126,28 @@ RegisterCitusConfigVariables(void)
 		5 * MS_PER_SECOND, 1, 7 * MS_PER_DAY,
 		PGC_SIGHUP,
 		GUC_UNIT_MS | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.metadata_sync_set_batch_size",
+		gettext_noop("Sets the number of distributed objects whose per-object "
+					 "metadata is folded into a single set-based statement during "
+					 "metadata sync."),
+		gettext_noop("The cheap per-object metadata layers (pg_dist_partition, "
+					 "pg_dist_shard, pg_dist_placement and pg_dist_object) are "
+					 "synced over the serial metadata connection by rendering each "
+					 "object's rows into a multi-row VALUES list fed to one "
+					 "set-based citus_internal_add_*_metadata statement, instead of "
+					 "one statement and one remote commit per object. This setting "
+					 "bounds how many objects' rows are packed into each such "
+					 "statement. Larger values emit fewer, larger statements (peak "
+					 "coordinator memory stays bounded by the batch, which is reset "
+					 "after every flush); 1 restores one statement per object. It is "
+					 "independent of the connection pool."),
+		&MetadataSyncSetBatchSize,
+		1000, 1, 10000,
+		PGC_SUSET,
+		GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
