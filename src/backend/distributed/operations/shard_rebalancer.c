@@ -580,37 +580,56 @@ GetRebalanceSteps(RebalanceOptions *options)
 	List *activeShardPlacementListList = NIL;
 	List *unbalancedShards = NIL;
 
+	/*
+	 * FullShardPlacementList() opens a CitusTableCacheEntry per table to read its
+	 * shard/placement arrays (copying fresh ShardPlacement nodes out), so this loop
+	 * -- the dominant phase of rebalance planning -- can grow the metadata cache to
+	 * one entry per distributed table. It retains only the copied placement lists,
+	 * never a cache entry, so bound the spike with a streaming eviction scope. No-op
+	 * when citus.max_cached_metadata_tables is disabled.
+	 */
 	Oid relationId = InvalidOid;
-	foreach_declared_oid(relationId, options->relationIdList)
+	BeginMetadataCacheEvictionScope();
+	PG_TRY();
 	{
-		List *shardPlacementList = FullShardPlacementList(relationId,
-														  options->excludedShardArray);
-		List *activeShardPlacementListForRelation =
-			FilterShardPlacementList(shardPlacementList, IsActiveShardPlacement);
+		foreach_declared_oid(relationId, options->relationIdList)
+		{
+			AdvanceMetadataCacheEvictionScope();
 
-		if (options->workerNode != NULL)
-		{
-			activeShardPlacementListForRelation = FilterActiveShardPlacementListByNode(
-				shardPlacementList, options->workerNode);
-		}
+			List *shardPlacementList = FullShardPlacementList(relationId,
+															  options->excludedShardArray);
+			List *activeShardPlacementListForRelation =
+				FilterShardPlacementList(shardPlacementList, IsActiveShardPlacement);
 
-		if (list_length(activeShardPlacementListForRelation) >= shardAllowedNodeCount)
-		{
-			activeShardPlacementListList = lappend(activeShardPlacementListList,
-												   activeShardPlacementListForRelation);
-		}
-		else
-		{
-			/*
-			 * If the number of shard groups are less than the number of worker nodes,
-			 * at least one of the worker nodes will remain empty. For such cases,
-			 * we consider those shard groups as a colocation group and try to
-			 * distribute them across the cluster.
-			 */
-			unbalancedShards = list_concat(unbalancedShards,
-										   activeShardPlacementListForRelation);
+			if (options->workerNode != NULL)
+			{
+				activeShardPlacementListForRelation = FilterActiveShardPlacementListByNode(
+					shardPlacementList, options->workerNode);
+			}
+
+			if (list_length(activeShardPlacementListForRelation) >= shardAllowedNodeCount)
+			{
+				activeShardPlacementListList = lappend(activeShardPlacementListList,
+													   activeShardPlacementListForRelation);
+			}
+			else
+			{
+				/*
+				 * If the number of shard groups are less than the number of worker
+				 * nodes, at least one of the worker nodes will remain empty. For such
+				 * cases, we consider those shard groups as a colocation group and try
+				 * to distribute them across the cluster.
+				 */
+				unbalancedShards = list_concat(unbalancedShards,
+											   activeShardPlacementListForRelation);
+			}
 		}
 	}
+	PG_FINALLY();
+	{
+		EndMetadataCacheEvictionScope();
+	}
+	PG_END_TRY();
 
 	if (list_length(unbalancedShards) > 0)
 	{
