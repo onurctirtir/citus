@@ -5129,46 +5129,64 @@ SyncDistributedObjects(MetadataSyncContext *context)
 
 	Assert(ShouldPropagate());
 
-	/* Send systemwide objects, only roles for now */
-	SendNodeWideObjectsSyncCommands(context);
-
 	/*
-	 * Break dependencies between sequences-shell tables, then remove shell tables,
-	 * and metadata tables respectively.
-	 * We should delete shell tables before metadata entries as we look inside
-	 * pg_dist_partition to figure out shell tables.
+	 * Bound the metadata cache for the whole sync: each phase below walks
+	 * distributed objects one at a time and turns them into plain SQL command
+	 * strings without retaining a CitusTableCacheEntry pointer across objects,
+	 * so entries built for earlier objects can be evicted (when
+	 * citus.max_cached_metadata_tables > 0) instead of accumulating for the
+	 * entire sync transaction. The individual phases call
+	 * AdvanceMetadataCacheEvictionScope() at their per-object boundaries.
 	 */
-	SendShellTableDeletionCommands(context);
-	SendMetadataDeletionCommands(context);
+	BeginMetadataCacheEvictionScope();
+	PG_TRY();
+	{
+		/* Send systemwide objects, only roles for now */
+		SendNodeWideObjectsSyncCommands(context);
 
-	/*
-	 * Commands to insert pg_dist_colocation entries.
-	 * Replicating dist objects and their metadata depends on this step.
-	 */
-	SendColocationMetadataCommands(context);
+		/*
+		 * Break dependencies between sequences-shell tables, then remove shell tables,
+		 * and metadata tables respectively.
+		 * We should delete shell tables before metadata entries as we look inside
+		 * pg_dist_partition to figure out shell tables.
+		 */
+		SendShellTableDeletionCommands(context);
+		SendMetadataDeletionCommands(context);
 
-	/*
-	 * Replicate all objects of the pg_dist_object to the remote node and
-	 * create metadata entries for Citus tables (pg_dist_shard, pg_dist_shard_placement,
-	 * pg_dist_partition, pg_dist_object).
-	 */
-	SendDependencyCreationCommands(context);
-	SendDistTableMetadataCommands(context);
-	SendDistObjectCommands(context);
+		/*
+		 * Commands to insert pg_dist_colocation entries.
+		 * Replicating dist objects and their metadata depends on this step.
+		 */
+		SendColocationMetadataCommands(context);
 
-	/*
-	 * Commands to insert pg_dist_schema entries.
-	 *
-	 * Need to be done after syncing distributed objects because the schemas
-	 * need to exist on the worker.
-	 */
-	SendTenantSchemaMetadataCommands(context);
+		/*
+		 * Replicate all objects of the pg_dist_object to the remote node and
+		 * create metadata entries for Citus tables (pg_dist_shard, pg_dist_shard_placement,
+		 * pg_dist_partition, pg_dist_object).
+		 */
+		SendDependencyCreationCommands(context);
+		SendDistTableMetadataCommands(context);
+		SendDistObjectCommands(context);
 
-	/*
-	 * After creating each table, handle the inter table relationship between
-	 * those tables.
-	 */
-	SendInterTableRelationshipCommands(context);
+		/*
+		 * Commands to insert pg_dist_schema entries.
+		 *
+		 * Need to be done after syncing distributed objects because the schemas
+		 * need to exist on the worker.
+		 */
+		SendTenantSchemaMetadataCommands(context);
+
+		/*
+		 * After creating each table, handle the inter table relationship between
+		 * those tables.
+		 */
+		SendInterTableRelationshipCommands(context);
+	}
+	PG_FINALLY();
+	{
+		EndMetadataCacheEvictionScope();
+	}
+	PG_END_TRY();
 }
 
 
@@ -5468,6 +5486,8 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 	ObjectAddress *dependency = NULL;
 	foreach_declared_ptr(dependency, dependencies)
 	{
+		AdvanceMetadataCacheEvictionScope();
+
 		if (!MetadataSyncCollectsCommands(context))
 		{
 			MemoryContextReset(commandsContext);
@@ -5519,15 +5539,6 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 	HeapTuple nextTuple = NULL;
 
-	/*
-	 * Bound the metadata cache while we stream every distributed table's
-	 * metadata: each iteration only needs the current table's cache entry and
-	 * turns it into plain SQL command strings, so entries produced by earlier
-	 * iterations can be evicted (when citus.max_cached_metadata_tables > 0)
-	 * instead of accumulating for the whole sync transaction.
-	 */
-	BeginMetadataCacheEvictionScope();
-
 	while (true)
 	{
 		ResetMetadataSyncMemoryContext(context);
@@ -5552,7 +5563,6 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 		List *commandList = CitusTableMetadataCreateCommandList(relationId);
 		SendOrCollectCommandListToActivatedNodes(context, commandList);
 	}
-	EndMetadataCacheEvictionScope();
 	MemoryContextSwitchTo(oldContext);
 
 	systable_endscan(scanDesc);
