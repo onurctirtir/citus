@@ -181,14 +181,17 @@ typedef List *(*NodeTargetedPoolDeparseFn)(HeapTuple tuple, TupleDesc tupleDesc,
 static void RunNodeTargetedPoolPhase(MetadataSyncContext *context,
 									 WorkerNode *workerNode, Oid scanRelationId,
 									 NodeTargetedPoolDeparseFn deparseFn,
-									 const char *objectLabel);
+									 const char *objectLabel,
+									 bool wrapObjectInTransaction);
 static List * DeparseObjectIntoTaskCommandList(HeapTuple heapTuple,
 											   TupleDesc tupleDesc,
 											   MetadataSyncContext *context,
 											   NodeTargetedPoolDeparseFn deparseFn,
 											   MemoryContext perObjectContext,
 											   MemoryContext waveContext,
-											   List *taskCommandList, bool *appended);
+											   List *taskCommandList,
+											   bool wrapObjectInTransaction,
+											   bool *appended);
 static List * ShellTablePoolDeparse(HeapTuple tuple, TupleDesc tupleDesc,
 									MetadataSyncContext *context);
 static List * SequencePoolDeparse(HeapTuple tuple, TupleDesc tupleDesc,
@@ -1421,6 +1424,47 @@ DistributionCreateCommand(CitusTableCacheEntry *cacheEntry)
 					 replicationModel);
 
 	return insertDistributionCommand->data;
+}
+
+
+/*
+ * ShouldBundlePartitionMetadataWithShellTable returns true when relationId's
+ * pg_dist_partition entry is (re)created together with the shell table's DDL
+ * bundle (see ShellTableCreationCommandList), rather than by the per-table
+ * metadata sender (SendDistTableMetadataCommands).
+ *
+ * Bundling the pg_dist_partition insert with the shell table CREATE keeps the
+ * "a pg_dist_partition row exists on the worker iff its shell table exists"
+ * invariant: both are (re)created in the same remote transaction, so an
+ * interrupted metadata sync can never leave a shell table without its
+ * pg_dist_partition row (or vice versa). That invariant is what lets the
+ * pg_dist_partition-driven shell table drop-and-recreate on the next sync
+ * actually reach (and heal) a drifted shell table.
+ *
+ * Two classes of tables are excluded here, and for them the pg_dist_partition
+ * row is synced by SendDistTableMetadataCommands instead:
+ *   - tables whose metadata we do not sync at all (ShouldSyncTableMetadata is
+ *     false); neither the bundle nor the per-table sender emits their row, and
+ *   - extension-owned shell tables, which are (re)created by CREATE EXTENSION on
+ *     the worker rather than by our shell table bundle, so there is no bundle to
+ *     attach the row to (ShellTablePoolDeparse likewise skips them).
+ */
+bool
+ShouldBundlePartitionMetadataWithShellTable(Oid relationId)
+{
+	if (!ShouldSyncTableMetadata(relationId))
+	{
+		return false;
+	}
+
+	ObjectAddress tableAddress = { 0 };
+	ObjectAddressSet(tableAddress, RelationRelationId, relationId);
+	if (IsAnyObjectAddressOwnedByExtension(list_make1(&tableAddress), NULL))
+	{
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -5472,11 +5516,22 @@ typedef List *(*NodeTargetedPoolDeparseFn)(HeapTuple tuple, TupleDesc tupleDesc,
  * This is the shared engine behind all metadata-sync pool phases (shell tables,
  * sequences, per-table shard/partition metadata, pg_dist_object marks); each
  * phase differs only in which relation it scans and in its deparseFn.
+ *
+ * When wrapObjectInTransaction is true, each object's command bundle is framed
+ * with an explicit remote BEGIN/COMMIT so that the whole bundle commits (or rolls
+ * back) atomically on the worker. This is required for the shell-table phase,
+ * where the CREATE and the pg_dist_partition insert must be one unit: the
+ * adaptive executor sends the task's commands as separate autocommitting simple
+ * queries in nontransactional mode, so without the wrap an interrupted sync could
+ * leave a shell table with no pg_dist_partition row (or vice versa), the exact
+ * partial-state drift the bundling is meant to prevent. Phases whose per-object
+ * command is a single idempotent statement (sequences, the metadata pool
+ * variants) pass false and keep plain per-statement autocommit.
  */
 static void
 RunNodeTargetedPoolPhase(MetadataSyncContext *context, WorkerNode *workerNode,
 						 Oid scanRelationId, NodeTargetedPoolDeparseFn deparseFn,
-						 const char *objectLabel)
+						 const char *objectLabel, bool wrapObjectInTransaction)
 {
 	int poolSize = MaxAdaptiveExecutorPoolSize;
 	if (poolSize < 1)
@@ -5582,6 +5637,7 @@ RunNodeTargetedPoolPhase(MetadataSyncContext *context, WorkerNode *workerNode,
 														 perObjectContext,
 														 waveContext,
 														 taskCommandList,
+														 wrapObjectInTransaction,
 														 &appended);
 
 					RollbackAndReleaseCurrentSubTransaction();
@@ -5605,7 +5661,9 @@ RunNodeTargetedPoolPhase(MetadataSyncContext *context, WorkerNode *workerNode,
 													 context, deparseFn,
 													 perObjectContext,
 													 waveContext,
-													 taskCommandList, &appended);
+													 taskCommandList,
+													 wrapObjectInTransaction,
+													 &appended);
 			}
 
 			if (appended)
@@ -5718,7 +5776,8 @@ DeparseObjectIntoTaskCommandList(HeapTuple heapTuple, TupleDesc tupleDesc,
 								 NodeTargetedPoolDeparseFn deparseFn,
 								 MemoryContext perObjectContext,
 								 MemoryContext waveContext,
-								 List *taskCommandList, bool *appended)
+								 List *taskCommandList,
+								 bool wrapObjectInTransaction, bool *appended)
 {
 	*appended = false;
 
@@ -5733,10 +5792,12 @@ DeparseObjectIntoTaskCommandList(HeapTuple heapTuple, TupleDesc tupleDesc,
 		if (taskCommandList == NIL)
 		{
 			/*
-			 * Each task runs as its own implicit transaction on a worker
-			 * backend; disable DDL propagation there so the DDL is not
-			 * re-propagated to the other nodes. This SET is a session GUC that
-			 * persists for the rest of the task's statements on that connection.
+			 * Disable DDL propagation on the worker backend so the DDL is not
+			 * re-propagated to the other nodes. This SET is kept OUTSIDE the
+			 * per-object BEGIN/COMMIT below (it is the task's first statement
+			 * and autocommits) so it is a session GUC that persists across all
+			 * of the task's statements on that connection, even if an object's
+			 * transaction rolls back.
 			 *
 			 * The commands are attached to the task as a query string list (one
 			 * statement per element) rather than a single concatenated string:
@@ -5749,10 +5810,31 @@ DeparseObjectIntoTaskCommandList(HeapTuple heapTuple, TupleDesc tupleDesc,
 			taskCommandList = list_make1(pstrdup(DISABLE_DDL_PROPAGATION));
 		}
 
+		/*
+		 * Frame this object's command bundle with an explicit remote
+		 * BEGIN/COMMIT when the caller requires the bundle to be atomic on the
+		 * worker (the shell-table phase, where CREATE + pg_dist_partition insert
+		 * must commit together). The executor sends each list element as a
+		 * separate simple query with no wrapping transaction in nontransactional
+		 * mode, so these plain BEGIN/COMMIT statements open and close a real
+		 * transaction block spanning the object's statements on that connection.
+		 * They return no rows, so they do not disturb the per-query result
+		 * bookkeeping.
+		 */
+		if (wrapObjectInTransaction)
+		{
+			taskCommandList = lappend(taskCommandList, pstrdup("BEGIN"));
+		}
+
 		char *command = NULL;
 		foreach_ptr(command, objectCommands)
 		{
 			taskCommandList = lappend(taskCommandList, pstrdup(command));
+		}
+
+		if (wrapObjectInTransaction)
+		{
+			taskCommandList = lappend(taskCommandList, pstrdup("COMMIT"));
 		}
 
 		*appended = true;
@@ -5921,7 +6003,8 @@ SendShellTableCreationCommandsViaPool(MetadataSyncContext *context)
 	foreach_ptr(workerNode, context->activatedWorkerNodeList)
 	{
 		RunNodeTargetedPoolPhase(context, workerNode, DistPartitionRelationId(),
-								 ShellTablePoolDeparse, "shell table creation");
+								 ShellTablePoolDeparse, "shell table creation",
+								 true);
 	}
 }
 
@@ -5946,7 +6029,8 @@ SendSequenceCreationCommandsViaPool(MetadataSyncContext *context)
 	foreach_ptr(workerNode, context->activatedWorkerNodeList)
 	{
 		RunNodeTargetedPoolPhase(context, workerNode, DistObjectRelationId(),
-								 SequencePoolDeparse, "sequence creation");
+								 SequencePoolDeparse, "sequence creation",
+								 false);
 	}
 }
 
@@ -5970,7 +6054,7 @@ SendDistTableMetadataCommandsViaPool(MetadataSyncContext *context)
 	{
 		RunNodeTargetedPoolPhase(context, workerNode, DistPartitionRelationId(),
 								 DistTableMetadataPoolDeparse,
-								 "dist table metadata creation");
+								 "dist table metadata creation", false);
 	}
 }
 
@@ -5994,7 +6078,7 @@ SendDistObjectCommandsViaPool(MetadataSyncContext *context)
 	{
 		RunNodeTargetedPoolPhase(context, workerNode, DistObjectRelationId(),
 								 DistObjectMarkPoolDeparse,
-								 "dist object metadata creation");
+								 "dist object metadata creation", false);
 	}
 }
 
@@ -6388,7 +6472,18 @@ AppendRelationMetadataBatchRows(Oid relationId, StringInfo partitionValues,
 	}
 
 	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
-	AppendDistributionMetadataBatchRow(partitionValues, cacheEntry);
+
+	/*
+	 * The pg_dist_partition row is bundled with the shell table CREATE for
+	 * tables that get a shell table bundle (see
+	 * ShouldBundlePartitionMetadataWithShellTable); only emit it here for the
+	 * excluded tables (e.g. extension-owned shell tables) so we neither
+	 * duplicate the row nor leave it out.
+	 */
+	if (!ShouldBundlePartitionMetadataWithShellTable(relationId))
+	{
+		AppendDistributionMetadataBatchRow(partitionValues, cacheEntry);
+	}
 
 	List *shardIntervalList = LoadShardIntervalList(relationId);
 	AppendShardMetadataBatchRows(shardValues, placementValues, shardIntervalList);
