@@ -5518,9 +5518,20 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 	HeapTuple nextTuple = NULL;
+
+	/*
+	 * Bound the metadata cache while we stream every distributed table's
+	 * metadata: each iteration only needs the current table's cache entry and
+	 * turns it into plain SQL command strings, so entries produced by earlier
+	 * iterations can be evicted (when citus.max_cached_metadata_tables > 0)
+	 * instead of accumulating for the whole sync transaction.
+	 */
+	BeginMetadataCacheEvictionScope();
+
 	while (true)
 	{
 		ResetMetadataSyncMemoryContext(context);
+		AdvanceMetadataCacheEvictionScope();
 
 		nextTuple = systable_getnext(scanDesc);
 		if (!HeapTupleIsValid(nextTuple))
@@ -5541,6 +5552,7 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 		List *commandList = CitusTableMetadataCreateCommandList(relationId);
 		SendOrCollectCommandListToActivatedNodes(context, commandList);
 	}
+	EndMetadataCacheEvictionScope();
 	MemoryContextSwitchTo(oldContext);
 
 	systable_endscan(scanDesc);

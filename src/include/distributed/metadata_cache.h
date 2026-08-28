@@ -191,6 +191,17 @@ extern DistObjectCacheEntry * LookupDistObjectCacheEntry(Oid classid, Oid objid,
 extern int32 GetLocalGroupId(void);
 extern int32 GetLocalNodeId(void);
 extern void CitusTableCacheFlushInvalidatedEntries(void);
+
+/*
+ * Prototype: streaming eviction scope. Wrap a self-contained loop that walks
+ * distributed tables one at a time (e.g. metadata sync) so that entries it
+ * produced in earlier iterations can be evicted within the same transaction,
+ * keeping the metadata cache bounded. Only has an effect when
+ * citus.max_cached_metadata_tables > 0. See metadata_cache.c for the contract.
+ */
+extern void BeginMetadataCacheEvictionScope(void);
+extern void AdvanceMetadataCacheEvictionScope(void);
+extern void EndMetadataCacheEvictionScope(void);
 extern Oid LookupShardRelationFromCatalog(int64 shardId, bool missing_ok);
 extern List * ShardPlacementList(uint64 shardId);
 extern void CitusInvalidateRelcacheByRelid(Oid relationId);

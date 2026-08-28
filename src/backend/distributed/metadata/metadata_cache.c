@@ -137,6 +137,20 @@ typedef struct CitusTableCacheEntrySlot
 	dlist_node lruNode;
 	uint64 lastAccessEpoch;
 	bool inLruList;
+
+	/*
+	 * Additional bookkeeping for the opt-in "streaming eviction scope" (see
+	 * BeginMetadataCacheEvictionScope). streamNode links the slot into
+	 * DistTableStreamLruList while a scope is active and the slot was touched
+	 * inside it; streamStamp records the scope's per-iteration epoch at that
+	 * touch. This lets a self-contained streaming loop (e.g. metadata sync)
+	 * evict entries it produced in *earlier* iterations even though they were
+	 * accessed in the current transaction -- something the transaction-level
+	 * epoch guard above deliberately forbids in the general case.
+	 */
+	dlist_node streamNode;
+	uint64 streamStamp;
+	bool inStreamList;
 } CitusTableCacheEntrySlot;
 
 
@@ -292,6 +306,19 @@ static int DistTableCacheEntryCount = 0;
 static uint64 DistTableCacheAccessEpoch = 1;
 static uint64 DistTableCacheEvictions = 0;
 
+/*
+ * State for the opt-in "streaming eviction scope" (BeginMetadataCacheEvictionScope /
+ * AdvanceMetadataCacheEvictionScope / EndMetadataCacheEvictionScope). While a scope
+ * is active, entries touched inside it are additionally linked into
+ * DistTableStreamLruList and stamped with StreamScopeIterEpoch. Eviction then works
+ * off this list and may free entries from *earlier* iterations of the scope, which
+ * bounds caches that would otherwise grow for the whole (single) transaction, e.g.
+ * metadata sync. StreamScopeDepth allows the scope to nest harmlessly.
+ */
+static dlist_head DistTableStreamLruList;
+static int StreamScopeDepth = 0;
+static uint64 StreamScopeIterEpoch = 0;
+
 /* Hash table for informations about each shard */
 static HTAB *ShardIdCacheHash = NULL;
 
@@ -345,6 +372,7 @@ static void CreateDistObjectCache(void);
 static void TouchCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot);
 static void TouchCitusTableCacheSlotByRelationId(Oid relationId);
 static void UnlinkCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot);
+static void EvictCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot);
 static void EvictLruMetadataEntriesIfNeeded(void);
 static void ResetDistTableLruState(void);
 static void InvalidateForeignRelationGraphCacheCallback(Datum argument, Oid relationId);
@@ -5117,6 +5145,14 @@ ResetDistTableLruState(void)
 {
 	dlist_init(&DistTableLruList);
 	DistTableCacheEntryCount = 0;
+
+	/*
+	 * The hash (and therefore every slot) is gone, so any in-flight streaming
+	 * scope no longer has entries to protect or evict. Reset it too.
+	 */
+	dlist_init(&DistTableStreamLruList);
+	StreamScopeDepth = 0;
+	StreamScopeIterEpoch = 0;
 }
 
 
@@ -5161,6 +5197,27 @@ TouchCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot)
 
 	dlist_push_head(&DistTableLruList, &cacheSlot->lruNode);
 	cacheSlot->lastAccessEpoch = DistTableCacheAccessEpoch;
+
+	/*
+	 * If we are inside a streaming eviction scope, additionally track this slot
+	 * on the scope's own MRU list and stamp it with the current per-iteration
+	 * epoch. Entries stamped with an *earlier* iteration become evictable even
+	 * within this transaction (see EvictLruMetadataEntriesIfNeeded).
+	 */
+	if (StreamScopeDepth > 0)
+	{
+		if (cacheSlot->inStreamList)
+		{
+			dlist_delete(&cacheSlot->streamNode);
+		}
+		else
+		{
+			cacheSlot->inStreamList = true;
+		}
+
+		dlist_push_head(&DistTableStreamLruList, &cacheSlot->streamNode);
+		cacheSlot->streamStamp = StreamScopeIterEpoch;
+	}
 }
 
 
@@ -5203,6 +5260,47 @@ UnlinkCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot)
 		cacheSlot->inLruList = false;
 		DistTableCacheEntryCount--;
 	}
+
+	if (cacheSlot->inStreamList)
+	{
+		dlist_delete(&cacheSlot->streamNode);
+		cacheSlot->inStreamList = false;
+	}
+}
+
+
+/*
+ * EvictCitusTableCacheSlot performs the actual teardown of one cached metadata
+ * entry: it unlinks the slot from the LRU (and stream) lists, drops the built
+ * metadata via the same path used by invalidation (ResetCitusTableCacheEntry,
+ * which also removes the entry's ShardIdCacheHash rows), and marks the slot
+ * invalid so the next access rebuilds it. Callers are responsible for the safety
+ * guard (transaction epoch, or streaming-scope iteration epoch) that guarantees
+ * no live bare pointer references the entry being freed.
+ */
+static void
+EvictCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot)
+{
+	CitusTableCacheEntry *metadata = cacheSlot->citusTableMetadata;
+
+	UnlinkCitusTableCacheSlot(cacheSlot);
+	cacheSlot->citusTableMetadata = NULL;
+
+	/* force a rebuild (and a fresh Citus/local recheck) on next access */
+	cacheSlot->isValid = false;
+
+	if (metadata != NULL)
+	{
+		ResetCitusTableCacheEntry(metadata);
+	}
+
+	DistTableCacheEvictions++;
+
+	ereport(DEBUG3, (errmsg("evicted metadata cache entry for relation %u "
+							"(cached=%d, limit=%d, total evictions=" UINT64_FORMAT
+							")",
+							cacheSlot->relationId, DistTableCacheEntryCount,
+							MaxCachedMetadataTables, DistTableCacheEvictions)));
 }
 
 
@@ -5223,12 +5321,43 @@ UnlinkCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot)
  * rows) but frees immediately -- the epoch guard guarantees no live pointer of
  * the current transaction is pointing at it, and Citus never retains metadata
  * pointers across transaction boundaries.
+ *
+ * Inside a streaming eviction scope we instead work off DistTableStreamLruList
+ * and use the scope's per-iteration epoch as the guard: entries stamped with an
+ * earlier iteration are safe to free (the scoped loop promises not to hold a
+ * pointer to an entry from a previous iteration), while entries stamped with the
+ * current iteration are protected. This is what lets a single long transaction
+ * such as metadata sync stay bounded.
  */
 static void
 EvictLruMetadataEntriesIfNeeded(void)
 {
 	if (MaxCachedMetadataTables <= 0)
 	{
+		return;
+	}
+
+	if (StreamScopeDepth > 0)
+	{
+		while (DistTableCacheEntryCount > MaxCachedMetadataTables &&
+			   !dlist_is_empty(&DistTableStreamLruList))
+		{
+			dlist_node *tailNode = dlist_tail_node(&DistTableStreamLruList);
+			CitusTableCacheEntrySlot *cacheSlot =
+				dlist_container(CitusTableCacheEntrySlot, streamNode, tailNode);
+
+			if (cacheSlot->streamStamp == StreamScopeIterEpoch)
+			{
+				/*
+				 * The stream MRU tail belongs to the current iteration, so every
+				 * remaining scope entry does too; those may be pinned right now.
+				 */
+				break;
+			}
+
+			EvictCitusTableCacheSlot(cacheSlot);
+		}
+
 		return;
 	}
 
@@ -5248,27 +5377,87 @@ EvictLruMetadataEntriesIfNeeded(void)
 			break;
 		}
 
-		CitusTableCacheEntry *metadata = cacheSlot->citusTableMetadata;
-
-		UnlinkCitusTableCacheSlot(cacheSlot);
-		cacheSlot->citusTableMetadata = NULL;
-
-		/* force a rebuild (and a fresh Citus/local recheck) on next access */
-		cacheSlot->isValid = false;
-
-		if (metadata != NULL)
-		{
-			ResetCitusTableCacheEntry(metadata);
-		}
-
-		DistTableCacheEvictions++;
-
-		ereport(DEBUG3, (errmsg("evicted metadata cache entry for relation %u "
-								"(cached=%d, limit=%d, total evictions=" UINT64_FORMAT
-								")",
-								cacheSlot->relationId, DistTableCacheEntryCount,
-								MaxCachedMetadataTables, DistTableCacheEvictions)));
+		EvictCitusTableCacheSlot(cacheSlot);
 	}
+}
+
+
+/*
+ * BeginMetadataCacheEvictionScope opens a streaming eviction scope. It must only
+ * be wrapped around a loop that (a) processes distributed tables one logical
+ * "iteration" at a time, (b) does not retain a CitusTableCacheEntry pointer from
+ * an earlier iteration once it advances, and (c) is not itself reached while an
+ * outer caller holds such a pointer to a table it will keep touching. Metadata
+ * sync's SendDistTableMetadataCommands loop satisfies all three. The caller must
+ * pair this with EndMetadataCacheEvictionScope (Citus' resource-release callback
+ * also force-closes any scope left open by an error, so a longjmp cannot leak
+ * it). Scopes nest harmlessly via StreamScopeDepth.
+ */
+void
+BeginMetadataCacheEvictionScope(void)
+{
+	if (MaxCachedMetadataTables <= 0)
+	{
+		return;
+	}
+
+	if (StreamScopeDepth == 0)
+	{
+		dlist_init(&DistTableStreamLruList);
+		StreamScopeIterEpoch = 1;
+	}
+
+	StreamScopeDepth++;
+}
+
+
+/*
+ * AdvanceMetadataCacheEvictionScope marks the boundary between two iterations of
+ * a streaming scope: entries touched before this call become evictable, and any
+ * over-limit entries are reclaimed now. Call it at the top of each iteration.
+ */
+void
+AdvanceMetadataCacheEvictionScope(void)
+{
+	if (MaxCachedMetadataTables <= 0 || StreamScopeDepth == 0)
+	{
+		return;
+	}
+
+	StreamScopeIterEpoch++;
+	EvictLruMetadataEntriesIfNeeded();
+}
+
+
+/*
+ * EndMetadataCacheEvictionScope closes the scope opened by
+ * BeginMetadataCacheEvictionScope. When the outermost scope closes it unlinks
+ * every slot still on the stream list (the slots themselves remain valid, cached
+ * entries) so no stale membership survives into a later scope.
+ */
+void
+EndMetadataCacheEvictionScope(void)
+{
+	if (MaxCachedMetadataTables <= 0 || StreamScopeDepth == 0)
+	{
+		return;
+	}
+
+	StreamScopeDepth--;
+	if (StreamScopeDepth > 0)
+	{
+		return;
+	}
+
+	while (!dlist_is_empty(&DistTableStreamLruList))
+	{
+		dlist_node *node = dlist_pop_head_node(&DistTableStreamLruList);
+		CitusTableCacheEntrySlot *cacheSlot =
+			dlist_container(CitusTableCacheEntrySlot, streamNode, node);
+		cacheSlot->inStreamList = false;
+	}
+
+	StreamScopeIterEpoch = 0;
 }
 
 
@@ -5449,6 +5638,16 @@ CitusTableCacheEntryReleaseCallback(ResourceReleasePhase phase, bool isCommit,
 	if (isTopLevel && phase == RESOURCE_RELEASE_LOCKS)
 	{
 		CitusTableCacheFlushInvalidatedEntries();
+
+		/*
+		 * Force-close any streaming eviction scope that an error left open, so a
+		 * longjmp out of a scoped loop cannot leave stale stream-list state
+		 * behind. EndMetadataCacheEvictionScope unlinks any lingering members.
+		 */
+		while (StreamScopeDepth > 0)
+		{
+			EndMetadataCacheEvictionScope();
+		}
 
 		/*
 		 * Advance the access epoch once per top-level transaction. Entries
