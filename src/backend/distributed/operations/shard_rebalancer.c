@@ -2027,7 +2027,6 @@ NonColocatedDistRelationIdList(void)
 
 	HTAB *alreadySelectedColocationIds = hash_create("RebalanceColocationIdSet",
 													 capacity, &info, flags);
-
 	foreach_declared_oid(tableId, allCitusTablesList)
 	{
 		bool foundInSet = false;
@@ -2055,7 +2054,6 @@ NonColocatedDistRelationIdList(void)
 		}
 		relationIdList = lappend_oid(relationIdList, tableId);
 	}
-
 	return relationIdList;
 }
 
