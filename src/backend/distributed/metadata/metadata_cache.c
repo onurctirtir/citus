@@ -1034,32 +1034,6 @@ IsSingleShardTableByDistParams(char partitionMethod, char replicationModel,
 
 
 /*
- * CitusTableList returns a list that includes all the valid distributed table
- * cache entries.
- */
-List *
-CitusTableList(void)
-{
-	List *distributedTableList = NIL;
-
-	Assert(CitusHasBeenLoaded() && CheckCitusVersion(WARNING));
-
-	/* first, we need to iterate over pg_dist_partition */
-	List *citusTableIdList = CitusTableTypeIdList(ANY_CITUS_TABLE_TYPE);
-
-	Oid relationId = InvalidOid;
-	foreach_declared_oid(relationId, citusTableIdList)
-	{
-		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
-
-		distributedTableList = lappend(distributedTableList, cacheEntry);
-	}
-
-	return distributedTableList;
-}
-
-
-/*
  * LoadShardInterval returns the, cached, metadata about a shard.
  *
  * The return value is a copy of the cached ShardInterval struct and may

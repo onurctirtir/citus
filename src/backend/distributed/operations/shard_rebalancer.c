@@ -2027,33 +2027,56 @@ NonColocatedDistRelationIdList(void)
 
 	HTAB *alreadySelectedColocationIds = hash_create("RebalanceColocationIdSet",
 													 capacity, &info, flags);
-	foreach_declared_oid(tableId, allCitusTablesList)
+
+	/*
+	 * This loop opens a CitusTableCacheEntry for every distributed table just to
+	 * read its colocationId, so on large clusters it can grow the metadata cache
+	 * to one entry per table. Bound that spike with a streaming eviction scope:
+	 * each iteration only reads the current entry and never retains it (only the
+	 * relation oid is appended to the result), and no caller holds a cache entry
+	 * across this helper, so entries touched here are free to be evicted once we
+	 * advance past them. The scope is a no-op when citus.max_cached_metadata_tables
+	 * is disabled.
+	 */
+	BeginMetadataCacheEvictionScope();
+	PG_TRY();
 	{
-		bool foundInSet = false;
-		CitusTableCacheEntry *citusTableCacheEntry = GetCitusTableCacheEntry(
-			tableId);
-
-		if (!IsCitusTableTypeCacheEntry(citusTableCacheEntry, DISTRIBUTED_TABLE))
+		foreach_declared_oid(tableId, allCitusTablesList)
 		{
-			/*
-			 * We're only interested in distributed tables, should ignore
-			 * reference tables and citus local tables.
-			 */
-			continue;
-		}
+			AdvanceMetadataCacheEvictionScope();
 
-		if (citusTableCacheEntry->colocationId != INVALID_COLOCATION_ID)
-		{
-			hash_search(alreadySelectedColocationIds,
-						&citusTableCacheEntry->colocationId, HASH_ENTER,
-						&foundInSet);
-			if (foundInSet)
+			bool foundInSet = false;
+			CitusTableCacheEntry *citusTableCacheEntry = GetCitusTableCacheEntry(
+				tableId);
+
+			if (!IsCitusTableTypeCacheEntry(citusTableCacheEntry, DISTRIBUTED_TABLE))
 			{
+				/*
+				 * We're only interested in distributed tables, should ignore
+				 * reference tables and citus local tables.
+				 */
 				continue;
 			}
+
+			if (citusTableCacheEntry->colocationId != INVALID_COLOCATION_ID)
+			{
+				hash_search(alreadySelectedColocationIds,
+							&citusTableCacheEntry->colocationId, HASH_ENTER,
+							&foundInSet);
+				if (foundInSet)
+				{
+					continue;
+				}
+			}
+			relationIdList = lappend_oid(relationIdList, tableId);
 		}
-		relationIdList = lappend_oid(relationIdList, tableId);
 	}
+	PG_FINALLY();
+	{
+		EndMetadataCacheEvictionScope();
+	}
+	PG_END_TRY();
+
 	return relationIdList;
 }
 

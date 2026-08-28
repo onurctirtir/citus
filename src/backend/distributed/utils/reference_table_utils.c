@@ -1041,22 +1041,42 @@ ReplicatedPlacementsForNodeGroup(int32 groupId)
 
 	List *replicatedPlacementsForNodeGroup = NIL;
 	Oid replicatedTableId = InvalidOid;
-	foreach_declared_oid(replicatedTableId, replicatedTableList)
-	{
-		List *placements =
-			GroupShardPlacementsForTableOnGroup(replicatedTableId, groupId);
-		if (list_length(placements) == 0)
-		{
-			/*
-			 * This happens either the node was previously disabled or the table
-			 * doesn't have placement on this node.
-			 */
-			continue;
-		}
 
-		replicatedPlacementsForNodeGroup = list_concat(replicatedPlacementsForNodeGroup,
-													   placements);
+	/*
+	 * GroupShardPlacementsForTableOnGroup() opens a CitusTableCacheEntry per table
+	 * to read its placement arrays (copying the matching placements out), so this
+	 * loop can also grow the metadata cache to one entry per replicated table. It
+	 * retains only the copied GroupShardPlacement structs, never a cache entry, so
+	 * bound the transient spike with a streaming eviction scope. No-op when
+	 * citus.max_cached_metadata_tables is disabled.
+	 */
+	BeginMetadataCacheEvictionScope();
+	PG_TRY();
+	{
+		foreach_declared_oid(replicatedTableId, replicatedTableList)
+		{
+			AdvanceMetadataCacheEvictionScope();
+
+			List *placements =
+				GroupShardPlacementsForTableOnGroup(replicatedTableId, groupId);
+			if (list_length(placements) == 0)
+			{
+				/*
+				 * This happens either the node was previously disabled or the table
+				 * doesn't have placement on this node.
+				 */
+				continue;
+			}
+
+			replicatedPlacementsForNodeGroup = list_concat(
+				replicatedPlacementsForNodeGroup, placements);
+		}
 	}
+	PG_FINALLY();
+	{
+		EndMetadataCacheEvictionScope();
+	}
+	PG_END_TRY();
 
 	return replicatedPlacementsForNodeGroup;
 }
@@ -1167,14 +1187,35 @@ ReplicatedMetadataSyncedDistributedTableList(void)
 	List *replicatedHashDistributedTableList = NIL;
 
 	Oid relationId = InvalidOid;
-	foreach_declared_oid(relationId, distributedRelationList)
+
+	/*
+	 * ShouldSyncTableMetadata() opens a CitusTableCacheEntry for every distributed
+	 * table just to classify it, so on large clusters this loop can grow the
+	 * metadata cache to one entry per table. Bound that transient spike with a
+	 * streaming eviction scope: each iteration only inspects the current table and
+	 * we retain nothing but the relation oid, so once we advance past a table its
+	 * entry is free to be evicted. No-op when citus.max_cached_metadata_tables is
+	 * disabled.
+	 */
+	BeginMetadataCacheEvictionScope();
+	PG_TRY();
 	{
-		if (ShouldSyncTableMetadata(relationId) && !SingleReplicatedTable(relationId))
+		foreach_declared_oid(relationId, distributedRelationList)
 		{
-			replicatedHashDistributedTableList =
-				lappend_oid(replicatedHashDistributedTableList, relationId);
+			AdvanceMetadataCacheEvictionScope();
+
+			if (ShouldSyncTableMetadata(relationId) && !SingleReplicatedTable(relationId))
+			{
+				replicatedHashDistributedTableList =
+					lappend_oid(replicatedHashDistributedTableList, relationId);
+			}
 		}
 	}
+	PG_FINALLY();
+	{
+		EndMetadataCacheEvictionScope();
+	}
+	PG_END_TRY();
 
 	return replicatedHashDistributedTableList;
 }

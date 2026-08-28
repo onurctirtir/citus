@@ -3107,18 +3107,27 @@ List *
 DetachPartitionCommandList(void)
 {
 	List *detachPartitionCommandList = NIL;
-	List *distributedTableList = CitusTableList();
+
+	/*
+	 * We only need the relation id of each distributed table here, and the
+	 * partition checks below hit the PostgreSQL relcache rather than the Citus
+	 * metadata cache. So we iterate the oid list directly instead of
+	 * CitusTableList(), which would materialize a CitusTableCacheEntry for
+	 * every distributed table (and hold them all alive at once) purely to read
+	 * ->relationId -- an unbounded metadata-cache spike on large clusters.
+	 */
+	List *citusTableIdList = CitusTableTypeIdList(ANY_CITUS_TABLE_TYPE);
 
 	/* we iterate over all distributed partitioned tables and DETACH their partitions */
-	CitusTableCacheEntry *cacheEntry = NULL;
-	foreach_declared_ptr(cacheEntry, distributedTableList)
+	Oid relationId = InvalidOid;
+	foreach_declared_oid(relationId, citusTableIdList)
 	{
-		if (!PartitionedTable(cacheEntry->relationId))
+		if (!PartitionedTable(relationId))
 		{
 			continue;
 		}
 
-		List *partitionList = PartitionList(cacheEntry->relationId);
+		List *partitionList = PartitionList(relationId);
 		List *detachCommands =
 			GenerateDetachPartitionCommandRelationIdList(partitionList);
 		detachPartitionCommandList = list_concat(detachPartitionCommandList,

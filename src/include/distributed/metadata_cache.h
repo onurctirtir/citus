@@ -173,7 +173,6 @@ extern bool IsCitusLocalTableByDistParams(char partitionMethod, char replication
 										  uint32 colocationId);
 extern bool IsSingleShardTableByDistParams(char partitionMethod, char replicationModel,
 										   uint32 colocationId);
-extern List * CitusTableList(void);
 extern ShardInterval * LoadShardInterval(uint64 shardId);
 extern bool ShardExists(uint64 shardId);
 extern Oid RelationIdForShard(uint64 shardId);

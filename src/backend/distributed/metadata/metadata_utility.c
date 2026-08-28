@@ -958,31 +958,51 @@ GenerateAllShardStatisticsQueryForNode(WorkerNode *workerNode, List *citusTableI
 	appendStringInfoString(allShardStatisticsQuery, " FROM (VALUES ");
 
 	Oid relationId = InvalidOid;
-	foreach_declared_oid(relationId, citusTableIds)
+
+	/*
+	 * ShardIntervalsOnWorkerGroup() opens a CitusTableCacheEntry per table (copying
+	 * out the shard intervals it needs), so this loop can grow the metadata cache to
+	 * one entry per distributed table -- and it runs once per worker node, so the
+	 * spike is repeated. We retain only the generated query string, never a cache
+	 * entry, so bound the transient spike with a streaming eviction scope. No-op when
+	 * citus.max_cached_metadata_tables is disabled.
+	 */
+	BeginMetadataCacheEvictionScope();
+	PG_TRY();
 	{
-		/*
-		 * Ensure the table still exists by trying to acquire a lock on it
-		 * If function returns NULL, it means the table doesn't exist
-		 * hence we should skip
-		 */
-		Relation relation = try_relation_open(relationId, AccessShareLock);
-		if (relation != NULL)
+		foreach_declared_oid(relationId, citusTableIds)
 		{
-			List *shardIntervalsOnNode = ShardIntervalsOnWorkerGroup(workerNode,
-																	 relationId);
-			if (list_length(shardIntervalsOnNode) == 0)
+			AdvanceMetadataCacheEvictionScope();
+
+			/*
+			 * Ensure the table still exists by trying to acquire a lock on it
+			 * If function returns NULL, it means the table doesn't exist
+			 * hence we should skip
+			 */
+			Relation relation = try_relation_open(relationId, AccessShareLock);
+			if (relation != NULL)
 			{
+				List *shardIntervalsOnNode = ShardIntervalsOnWorkerGroup(workerNode,
+																		 relationId);
+				if (list_length(shardIntervalsOnNode) == 0)
+				{
+					relation_close(relation, AccessShareLock);
+					continue;
+				}
+				char *shardIdNameValues =
+					GenerateShardIdNameValuesForShardList(shardIntervalsOnNode,
+														  !insertedValues);
+				insertedValues = true;
+				appendStringInfoString(allShardStatisticsQuery, shardIdNameValues);
 				relation_close(relation, AccessShareLock);
-				continue;
 			}
-			char *shardIdNameValues =
-				GenerateShardIdNameValuesForShardList(shardIntervalsOnNode,
-													  !insertedValues);
-			insertedValues = true;
-			appendStringInfoString(allShardStatisticsQuery, shardIdNameValues);
-			relation_close(relation, AccessShareLock);
 		}
 	}
+	PG_FINALLY();
+	{
+		EndMetadataCacheEvictionScope();
+	}
+	PG_END_TRY();
 
 	if (!insertedValues)
 	{
