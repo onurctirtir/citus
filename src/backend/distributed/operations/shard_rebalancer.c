@@ -580,56 +580,37 @@ GetRebalanceSteps(RebalanceOptions *options)
 	List *activeShardPlacementListList = NIL;
 	List *unbalancedShards = NIL;
 
-	/*
-	 * FullShardPlacementList() opens a CitusTableCacheEntry per table to read its
-	 * shard/placement arrays (copying fresh ShardPlacement nodes out), so this loop
-	 * -- the dominant phase of rebalance planning -- can grow the metadata cache to
-	 * one entry per distributed table. It retains only the copied placement lists,
-	 * never a cache entry, so bound the spike with a streaming eviction scope. No-op
-	 * when citus.max_cached_metadata_tables is disabled.
-	 */
 	Oid relationId = InvalidOid;
-	BeginMetadataCacheEvictionScope();
-	PG_TRY();
+	foreach_declared_oid(relationId, options->relationIdList)
 	{
-		foreach_declared_oid(relationId, options->relationIdList)
+		List *shardPlacementList = FullShardPlacementList(relationId,
+														  options->excludedShardArray);
+		List *activeShardPlacementListForRelation =
+			FilterShardPlacementList(shardPlacementList, IsActiveShardPlacement);
+
+		if (options->workerNode != NULL)
 		{
-			AdvanceMetadataCacheEvictionScope();
+			activeShardPlacementListForRelation = FilterActiveShardPlacementListByNode(
+				shardPlacementList, options->workerNode);
+		}
 
-			List *shardPlacementList = FullShardPlacementList(relationId,
-															  options->excludedShardArray);
-			List *activeShardPlacementListForRelation =
-				FilterShardPlacementList(shardPlacementList, IsActiveShardPlacement);
-
-			if (options->workerNode != NULL)
-			{
-				activeShardPlacementListForRelation = FilterActiveShardPlacementListByNode(
-					shardPlacementList, options->workerNode);
-			}
-
-			if (list_length(activeShardPlacementListForRelation) >= shardAllowedNodeCount)
-			{
-				activeShardPlacementListList = lappend(activeShardPlacementListList,
-													   activeShardPlacementListForRelation);
-			}
-			else
-			{
-				/*
-				 * If the number of shard groups are less than the number of worker
-				 * nodes, at least one of the worker nodes will remain empty. For such
-				 * cases, we consider those shard groups as a colocation group and try
-				 * to distribute them across the cluster.
-				 */
-				unbalancedShards = list_concat(unbalancedShards,
-											   activeShardPlacementListForRelation);
-			}
+		if (list_length(activeShardPlacementListForRelation) >= shardAllowedNodeCount)
+		{
+			activeShardPlacementListList = lappend(activeShardPlacementListList,
+												   activeShardPlacementListForRelation);
+		}
+		else
+		{
+			/*
+			 * If the number of shard groups are less than the number of worker nodes,
+			 * at least one of the worker nodes will remain empty. For such cases,
+			 * we consider those shard groups as a colocation group and try to
+			 * distribute them across the cluster.
+			 */
+			unbalancedShards = list_concat(unbalancedShards,
+										   activeShardPlacementListForRelation);
 		}
 	}
-	PG_FINALLY();
-	{
-		EndMetadataCacheEvictionScope();
-	}
-	PG_END_TRY();
 
 	if (list_length(unbalancedShards) > 0)
 	{
@@ -2047,54 +2028,33 @@ NonColocatedDistRelationIdList(void)
 	HTAB *alreadySelectedColocationIds = hash_create("RebalanceColocationIdSet",
 													 capacity, &info, flags);
 
-	/*
-	 * This loop opens a CitusTableCacheEntry for every distributed table just to
-	 * read its colocationId, so on large clusters it can grow the metadata cache
-	 * to one entry per table. Bound that spike with a streaming eviction scope:
-	 * each iteration only reads the current entry and never retains it (only the
-	 * relation oid is appended to the result), and no caller holds a cache entry
-	 * across this helper, so entries touched here are free to be evicted once we
-	 * advance past them. The scope is a no-op when citus.max_cached_metadata_tables
-	 * is disabled.
-	 */
-	BeginMetadataCacheEvictionScope();
-	PG_TRY();
+	foreach_declared_oid(tableId, allCitusTablesList)
 	{
-		foreach_declared_oid(tableId, allCitusTablesList)
+		bool foundInSet = false;
+		CitusTableCacheEntry *citusTableCacheEntry = GetCitusTableCacheEntry(
+			tableId);
+
+		if (!IsCitusTableTypeCacheEntry(citusTableCacheEntry, DISTRIBUTED_TABLE))
 		{
-			AdvanceMetadataCacheEvictionScope();
+			/*
+			 * We're only interested in distributed tables, should ignore
+			 * reference tables and citus local tables.
+			 */
+			continue;
+		}
 
-			bool foundInSet = false;
-			CitusTableCacheEntry *citusTableCacheEntry = GetCitusTableCacheEntry(
-				tableId);
-
-			if (!IsCitusTableTypeCacheEntry(citusTableCacheEntry, DISTRIBUTED_TABLE))
+		if (citusTableCacheEntry->colocationId != INVALID_COLOCATION_ID)
+		{
+			hash_search(alreadySelectedColocationIds,
+						&citusTableCacheEntry->colocationId, HASH_ENTER,
+						&foundInSet);
+			if (foundInSet)
 			{
-				/*
-				 * We're only interested in distributed tables, should ignore
-				 * reference tables and citus local tables.
-				 */
 				continue;
 			}
-
-			if (citusTableCacheEntry->colocationId != INVALID_COLOCATION_ID)
-			{
-				hash_search(alreadySelectedColocationIds,
-							&citusTableCacheEntry->colocationId, HASH_ENTER,
-							&foundInSet);
-				if (foundInSet)
-				{
-					continue;
-				}
-			}
-			relationIdList = lappend_oid(relationIdList, tableId);
 		}
+		relationIdList = lappend_oid(relationIdList, tableId);
 	}
-	PG_FINALLY();
-	{
-		EndMetadataCacheEvictionScope();
-	}
-	PG_END_TRY();
 
 	return relationIdList;
 }
