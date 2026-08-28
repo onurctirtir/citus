@@ -32,6 +32,7 @@
 #include "commands/trigger.h"
 #include "common/hashfn.h"
 #include "executor/executor.h"
+#include "lib/ilist.h"
 #include "nodes/makefuncs.h"
 #include "nodes/memnodes.h"
 #include "nodes/pg_list.h"
@@ -92,6 +93,14 @@
 /* user configuration */
 int ReadFromSecondaries = USE_SECONDARY_NODES_NEVER;
 
+/*
+ * Maximum number of distributed-table metadata entries kept in the per-backend
+ * cache. 0 (the default) means unbounded, which preserves the historical
+ * behavior. When positive, least-recently-used entries are evicted once the
+ * cache grows beyond this many entries. (Prototype.)
+ */
+int MaxCachedMetadataTables = 0;
+
 
 /*
  * CitusTableCacheEntrySlot is entry type for DistTableCacheHash,
@@ -110,6 +119,24 @@ typedef struct CitusTableCacheEntrySlot
 	 * belongs to a Citus or not.
 	 */
 	bool isValid;
+
+	/*
+	 * LRU bookkeeping for the (prototype) bounded metadata cache.
+	 *
+	 * lruNode links this slot into the global DistTableLruList (MRU at head,
+	 * LRU at tail). A slot is linked iff inLruList is true, which we keep in
+	 * sync with "citusTableMetadata != NULL". lastAccessEpoch records the cache
+	 * access epoch (bumped once per top-level transaction) at which this entry
+	 * was last handed out, so that we never evict an entry that a caller of the
+	 * current transaction may still be holding a bare pointer to.
+	 *
+	 * These fields are only maintained when citus.max_cached_metadata_tables is
+	 * greater than zero; otherwise the default (unbounded) behavior is used and
+	 * these fields stay untouched.
+	 */
+	dlist_node lruNode;
+	uint64 lastAccessEpoch;
+	bool inLruList;
 } CitusTableCacheEntrySlot;
 
 
@@ -248,6 +275,23 @@ static int CreateCitusTransactionLevel = 0;
 static HTAB *DistTableCacheHash = NULL;
 static List *DistTableCacheExpired = NIL;
 
+/*
+ * LRU bookkeeping for the (prototype) bounded metadata cache. See the
+ * citus.max_cached_metadata_tables GUC and TouchCitusTableCacheSlot() /
+ * EvictLruMetadataEntriesIfNeeded() below.
+ *
+ * DistTableLruList threads every DistTableCacheHash slot that currently holds
+ * built metadata (MRU at head, LRU at tail). DistTableCacheEntryCount is the
+ * number of linked slots. DistTableCacheAccessEpoch is bumped once per
+ * top-level transaction so we can cheaply tell whether an entry might still be
+ * pinned by the current transaction. DistTableCacheEvictions is a diagnostic
+ * counter.
+ */
+static dlist_head DistTableLruList;
+static int DistTableCacheEntryCount = 0;
+static uint64 DistTableCacheAccessEpoch = 1;
+static uint64 DistTableCacheEvictions = 0;
+
 /* Hash table for informations about each shard */
 static HTAB *ShardIdCacheHash = NULL;
 
@@ -298,6 +342,11 @@ static void RemoveStaleShardIdCacheEntries(CitusTableCacheEntry *tableEntry);
 static void CreateDistTableCache(void);
 static void CreateShardIdCache(void);
 static void CreateDistObjectCache(void);
+static void TouchCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot);
+static void TouchCitusTableCacheSlotByRelationId(Oid relationId);
+static void UnlinkCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot);
+static void EvictLruMetadataEntriesIfNeeded(void);
+static void ResetDistTableLruState(void);
 static void InvalidateForeignRelationGraphCacheCallback(Datum argument, Oid relationId);
 static void InvalidateNodeRelationCacheCallback(Datum argument, Oid relationId);
 static void InvalidateLocalGroupIdRelationCacheCallback(Datum argument, Oid relationId);
@@ -1503,6 +1552,17 @@ LookupShardIdCacheEntry(int64 shardId, bool missingOk)
 		}
 	}
 
+	/*
+	 * Protect the owning table entry from LRU eviction: callers dereference
+	 * shardEntry->tableEntry (the table's metadata) without going through
+	 * LookupCitusTableCacheEntry on this fast path, so stamp it as used now.
+	 * This is a no-op unless the bounded cache is enabled.
+	 */
+	if (shardEntry != NULL)
+	{
+		TouchCitusTableCacheSlotByRelationId(shardEntry->tableEntry->relationId);
+	}
+
 	return shardEntry;
 }
 
@@ -1603,6 +1663,7 @@ LookupCitusTableCacheEntry(Oid relationId)
 	{
 		if (cacheSlot->isValid)
 		{
+			TouchCitusTableCacheSlot(cacheSlot);
 			return cacheSlot->citusTableMetadata;
 		}
 		else
@@ -1610,7 +1671,11 @@ LookupCitusTableCacheEntry(Oid relationId)
 			/*
 			 * An invalidation was received or we encountered an OOM while building
 			 * the cache entry. We need to rebuild it.
+			 *
+			 * The slot is about to be zeroed and rebuilt below, so drop its LRU
+			 * membership first to keep the bounded-cache bookkeeping consistent.
 			 */
+			UnlinkCitusTableCacheSlot(cacheSlot);
 
 			if (cacheSlot->citusTableMetadata)
 			{
@@ -1650,6 +1715,13 @@ LookupCitusTableCacheEntry(Oid relationId)
 	cacheSlot->isValid = true;
 
 	RESUME_INTERRUPTS();
+
+	/*
+	 * Record this entry as most-recently-used and, if the bounded cache is
+	 * enabled, evict least-recently-used entries that are safe to drop.
+	 */
+	TouchCitusTableCacheSlot(cacheSlot);
+	EvictLruMetadataEntriesIfNeeded();
 
 	return cacheSlot->citusTableMetadata;
 }
@@ -4997,6 +5069,9 @@ CreateDistTableCache(void)
 	DistTableCacheHash =
 		hash_create("Distributed Relation Cache", 32, &info,
 					HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+
+	/* the slots that used to live in the LRU list are gone with the hash */
+	ResetDistTableLruState();
 }
 
 
@@ -5029,6 +5104,171 @@ CreateDistObjectCache(void)
 	DistObjectCacheHash =
 		hash_create("Distributed Object Cache", 32, &info,
 					HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+}
+
+
+/*
+ * ResetDistTableLruState (re-)initializes the LRU bookkeeping for the bounded
+ * metadata cache. It is called whenever DistTableCacheHash is (re)created, at
+ * which point any previously linked slots are gone.
+ */
+static void
+ResetDistTableLruState(void)
+{
+	dlist_init(&DistTableLruList);
+	DistTableCacheEntryCount = 0;
+}
+
+
+/*
+ * TouchCitusTableCacheSlot marks a slot as most-recently-used and stamps it
+ * with the current cache access epoch. It is a no-op unless the bounded cache
+ * is enabled (citus.max_cached_metadata_tables > 0) and the slot actually holds
+ * built metadata.
+ *
+ * The epoch stamp is what makes eviction safe without reference counting:
+ * callers receive a bare CitusTableCacheEntry pointer that they may hold for the
+ * remainder of the transaction, so we must never free an entry that was handed
+ * out during the current (top-level) transaction. Since the epoch only advances
+ * at top-level transaction boundaries, any entry touched this transaction keeps
+ * lastAccessEpoch == DistTableCacheAccessEpoch and is therefore skipped by
+ * EvictLruMetadataEntriesIfNeeded().
+ */
+static void
+TouchCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot)
+{
+	if (MaxCachedMetadataTables <= 0)
+	{
+		/* bounded cache disabled: keep the historical, unbounded behavior */
+		return;
+	}
+
+	if (cacheSlot->citusTableMetadata == NULL)
+	{
+		/* nothing heavy to account for (e.g. a negative/local-table slot) */
+		return;
+	}
+
+	if (cacheSlot->inLruList)
+	{
+		dlist_delete(&cacheSlot->lruNode);
+	}
+	else
+	{
+		cacheSlot->inLruList = true;
+		DistTableCacheEntryCount++;
+	}
+
+	dlist_push_head(&DistTableLruList, &cacheSlot->lruNode);
+	cacheSlot->lastAccessEpoch = DistTableCacheAccessEpoch;
+}
+
+
+/*
+ * TouchCitusTableCacheSlotByRelationId looks up the slot for relationId and
+ * marks it most-recently-used. This is used on the shard-id lookup fast path,
+ * where callers dereference shardEntry->tableEntry (i.e. the table's metadata)
+ * without going through LookupCitusTableCacheEntry, so we must protect that
+ * table entry from eviction just the same.
+ */
+static void
+TouchCitusTableCacheSlotByRelationId(Oid relationId)
+{
+	if (MaxCachedMetadataTables <= 0 || DistTableCacheHash == NULL)
+	{
+		return;
+	}
+
+	bool foundInCache = false;
+	CitusTableCacheEntrySlot *cacheSlot =
+		hash_search(DistTableCacheHash, &relationId, HASH_FIND, &foundInCache);
+	if (foundInCache)
+	{
+		TouchCitusTableCacheSlot(cacheSlot);
+	}
+}
+
+
+/*
+ * UnlinkCitusTableCacheSlot removes a slot from the LRU list, if linked. It must
+ * be called whenever a slot stops holding built metadata (eviction), so the LRU
+ * list and DistTableCacheEntryCount stay consistent.
+ */
+static void
+UnlinkCitusTableCacheSlot(CitusTableCacheEntrySlot *cacheSlot)
+{
+	if (cacheSlot->inLruList)
+	{
+		dlist_delete(&cacheSlot->lruNode);
+		cacheSlot->inLruList = false;
+		DistTableCacheEntryCount--;
+	}
+}
+
+
+/*
+ * EvictLruMetadataEntriesIfNeeded frees least-recently-used metadata entries
+ * until the number of cached metadata entries is back within
+ * citus.max_cached_metadata_tables.
+ *
+ * Eviction is skipped for any entry that was accessed during the current
+ * transaction (lastAccessEpoch == DistTableCacheAccessEpoch), because such an
+ * entry may still be referenced by a live bare pointer. As the LRU tail is the
+ * oldest entry, encountering a current-epoch entry at the tail means every
+ * remaining entry is from this transaction and nothing is safe to evict, so we
+ * stop.
+ *
+ * Evicting an entry re-uses the same teardown path as invalidation
+ * (ResetCitusTableCacheEntry, which also drops the entry's ShardIdCacheHash
+ * rows) but frees immediately -- the epoch guard guarantees no live pointer of
+ * the current transaction is pointing at it, and Citus never retains metadata
+ * pointers across transaction boundaries.
+ */
+static void
+EvictLruMetadataEntriesIfNeeded(void)
+{
+	if (MaxCachedMetadataTables <= 0)
+	{
+		return;
+	}
+
+	while (DistTableCacheEntryCount > MaxCachedMetadataTables &&
+		   !dlist_is_empty(&DistTableLruList))
+	{
+		dlist_node *tailNode = dlist_tail_node(&DistTableLruList);
+		CitusTableCacheEntrySlot *cacheSlot =
+			dlist_container(CitusTableCacheEntrySlot, lruNode, tailNode);
+
+		if (cacheSlot->lastAccessEpoch == DistTableCacheAccessEpoch)
+		{
+			/*
+			 * Oldest entry was still touched this transaction; everything left
+			 * may be pinned, so we cannot safely evict anything right now.
+			 */
+			break;
+		}
+
+		CitusTableCacheEntry *metadata = cacheSlot->citusTableMetadata;
+
+		UnlinkCitusTableCacheSlot(cacheSlot);
+		cacheSlot->citusTableMetadata = NULL;
+
+		/* force a rebuild (and a fresh Citus/local recheck) on next access */
+		cacheSlot->isValid = false;
+
+		if (metadata != NULL)
+		{
+			ResetCitusTableCacheEntry(metadata);
+		}
+
+		DistTableCacheEvictions++;
+
+		ereport(DEBUG3, (errmsg("evicted metadata cache entry for relation %u "
+								"(cached=%d, limit=%d, total evictions=" UINT64_FORMAT
+								")",
+								cacheSlot->relationId, DistTableCacheEntryCount,
+								MaxCachedMetadataTables, DistTableCacheEvictions)));
+	}
 }
 
 
@@ -5209,6 +5449,16 @@ CitusTableCacheEntryReleaseCallback(ResourceReleasePhase phase, bool isCommit,
 	if (isTopLevel && phase == RESOURCE_RELEASE_LOCKS)
 	{
 		CitusTableCacheFlushInvalidatedEntries();
+
+		/*
+		 * Advance the access epoch once per top-level transaction. Entries
+		 * touched during the just-finished transaction carry the previous
+		 * epoch, so from now on they become eligible for LRU eviction. This is
+		 * what makes eviction safe without reference counting: we never evict
+		 * an entry that was accessed in the current (still-running) transaction,
+		 * because callers may still hold bare pointers into it.
+		 */
+		DistTableCacheAccessEpoch++;
 	}
 }
 

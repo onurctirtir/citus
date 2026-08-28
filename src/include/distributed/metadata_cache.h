@@ -31,6 +31,13 @@ typedef enum
 } ReadFromSecondariesType;
 extern int ReadFromSecondaries;
 
+/*
+ * Prototype: upper bound on the number of distributed-table metadata entries
+ * kept in the per-backend cache. 0 (default) means unbounded (historical
+ * behavior). Managed via guc.c. See metadata_cache.c for the LRU eviction.
+ */
+extern int MaxCachedMetadataTables;
+
 
 /*
  * While upgrading pg_dist_local_group can be empty temporarily, in that

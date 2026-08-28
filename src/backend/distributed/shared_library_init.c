@@ -2190,6 +2190,26 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
+		"citus.max_cached_metadata_tables",
+		gettext_noop("Sets the maximum number of distributed table metadata "
+					 "entries cached per backend (0 means unlimited)."),
+		gettext_noop("Each backend caches metadata (shard intervals, placements, "
+					 "foreign key relationships, etc.) for the distributed tables "
+					 "it touches. This cache is normally unbounded, which can grow "
+					 "large in clusters with very many distributed tables or during "
+					 "operations that open every table (e.g. metadata sync). When "
+					 "set to a positive value, least-recently-used entries that are "
+					 "not referenced by the current transaction are evicted to keep "
+					 "the cache within this bound. Entries are transparently rebuilt "
+					 "on the next access, so this only trades memory for occasional "
+					 "rebuild work; it never affects query results."),
+		&MaxCachedMetadataTables,
+		0, 0, INT_MAX,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
 		"citus.max_client_connections",
 		gettext_noop("Sets the maximum number of connections regular clients can make"),
 		gettext_noop("To ensure that a Citus cluster has a sufficient number of "
