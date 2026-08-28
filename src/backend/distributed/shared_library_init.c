@@ -2084,6 +2084,40 @@ RegisterCitusConfigVariables(void)
 		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"citus.metadata_sync_pool_skip_execute",
+		gettext_noop("Builds pooled metadata sync command batches without "
+					 "executing them on the worker (developer only)."),
+		gettext_noop("When enabled, the pooled metadata sync phases deparse "
+					 "each wave's command strings but skip executing them on the "
+					 "activated node. This isolates coordinator-side deparse cost "
+					 "from worker-side execution when diagnosing sync performance; "
+					 "it leaves the worker incomplete and must never be enabled in "
+					 "production. Off by default."),
+		&MetadataSyncPoolSkipExecute,
+		false,
+		PGC_SUSET,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.metadata_sync_release_deparse_locks",
+		gettext_noop("Releases per-object catalog locks during pooled metadata "
+					 "sync by deparsing inside a rolled-back subtransaction."),
+		gettext_noop("When enabled (the default) and metadata sync uses the "
+					 "parallel pool, each distributed object's command bundle is "
+					 "deparsed inside an internal subtransaction that is rolled "
+					 "back once the command strings are copied out. This releases "
+					 "the AccessShareLocks and relcache pins taken during deparse "
+					 "per object, bounding the coordinator lock table and backend "
+					 "memory to a single object instead of growing linearly with "
+					 "the number of distributed objects. On by default."),
+		&MetadataSyncReleaseDeparseLocks,
+		true,
+		PGC_SUSET,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		"citus.metadata_sync_retry_interval",
 		gettext_noop("Sets the interval to retry failed metadata syncs."),

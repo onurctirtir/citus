@@ -33,6 +33,8 @@ extern int MetadataSyncTransMode;
 extern int MetadataSyncCacheFlushInterval;
 extern int MetadataSyncBatchSize;
 extern bool MetadataSyncUsePool;
+extern bool MetadataSyncReleaseDeparseLocks;
+extern bool MetadataSyncPoolSkipExecute;
 
 /*
  * MetadataSyncContext is used throughout metadata sync.
