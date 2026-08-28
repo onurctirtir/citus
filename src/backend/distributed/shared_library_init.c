@@ -2018,22 +2018,20 @@ RegisterCitusConfigVariables(void)
 
 	DefineCustomIntVariable(
 		"citus.metadata_sync_batch_size",
-		gettext_noop("Sets the number of distributed objects whose metadata-sync "
-					 "commands are sent to a node in a single round-trip."),
-		gettext_noop("While activating a node, Citus builds and sends the shell "
-					 "table, metadata and dependency creation commands for each "
-					 "distributed object. Sending them one object at a time incurs "
-					 "a network round-trip - and, in nontransactional mode, a "
-					 "separate remote transaction - per object, which is slow when "
-					 "syncing metadata for a very large number of distributed "
-					 "tables. Citus instead accumulates the commands of this many "
-					 "objects and sends them together. Larger batches mean fewer "
-					 "round-trips but larger remote transactions in nontransactional "
-					 "mode, and the batch's transaction holds more locks at once "
-					 "(each object's creation commands take locks that are kept "
-					 "until the transaction ends), so a very large batch can exhaust "
-					 "the remote node's shared lock table (sized by "
-					 "max_locks_per_transaction). Setting this to 1 disables batching."),
+		gettext_noop("Sets the number of distributed objects grouped into a single "
+					 "parallel metadata-sync task."),
+		gettext_noop("When citus.metadata_sync_use_pool is enabled, Citus spreads "
+					 "the shell-table and metadata creation work for a node being "
+					 "activated across a pool of connections (sized by "
+					 "citus.max_adaptive_executor_pool_size). This setting controls "
+					 "how many distributed objects' commands are packed into each "
+					 "task handed to a pool connection. Larger values mean fewer, "
+					 "bigger tasks (each running in one remote transaction that holds "
+					 "the objects' creation locks until it commits, so a very large "
+					 "value can exhaust the remote node's shared lock table, sized by "
+					 "max_locks_per_transaction); smaller values give finer-grained "
+					 "load balancing across the pool. It has no effect when the pool "
+					 "is disabled."),
 		&MetadataSyncBatchSize,
 		1000, 1, 10000,
 		PGC_SUSET,
