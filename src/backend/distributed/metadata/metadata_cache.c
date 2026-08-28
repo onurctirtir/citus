@@ -5408,6 +5408,8 @@ BeginMetadataCacheEvictionScope(void)
 	}
 
 	StreamScopeDepth++;
+	ereport(DEBUG1, (errmsg("STREAMSCOPE begin depth=%d count=%d",
+							StreamScopeDepth, DistTableCacheEntryCount)));
 }
 
 
@@ -5425,6 +5427,9 @@ AdvanceMetadataCacheEvictionScope(void)
 	}
 
 	StreamScopeIterEpoch++;
+	ereport(DEBUG1, (errmsg("STREAMSCOPE advance epoch=" UINT64_FORMAT
+							" depth=%d count=%d", StreamScopeIterEpoch,
+							StreamScopeDepth, DistTableCacheEntryCount)));
 	EvictLruMetadataEntriesIfNeeded();
 }
 
