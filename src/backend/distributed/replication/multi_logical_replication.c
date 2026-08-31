@@ -118,6 +118,16 @@ int LogicalReplicationTimeout = 2 * 60 * 60 * 1000;
  */
 bool SetReplicaIdentityFullForLogicalReplication = false;
 
+/*
+ * GUC variable. When true, if a table lacks an early-built replica identity index
+ * (i.e. it has no primary key and no REPLICA IDENTITY USING INDEX) but does have
+ * an existing index the subscriber can use under REPLICA IDENTITY FULL, Citus
+ * builds that index on the destination shard early (right after the initial COPY,
+ * before the catch-up) instead of in the late post-load phase. This lets the
+ * subscriber use an index scan during the bulk catch-up. Defaults to off.
+ */
+bool CreateExistingIndexesEarlyForLogicalReplication = false;
+
 
 /* see the comment in master_move_shard_placement */
 bool PlacementMovedUsingLogicalReplicationInTX = false;
@@ -133,7 +143,7 @@ static List * GetIndexCommandListForShardBackingReplicaIdentity(Oid relationId,
 static void CreatePostLogicalReplicationDataLoadObjects(List *logicalRepTargetList,
 														LogicalRepType type,
 														bool skipInterShardRelationships);
-static void ExecuteCreateIndexCommands(List *logicalRepTargetList);
+static void ExecuteCreateIndexCommands(List *logicalRepTargetList, LogicalRepType type);
 static void ExecuteCreateConstraintsBackedByIndexCommands(List *logicalRepTargetList);
 static List * ConvertNonExistingPlacementDDLCommandsToTasks(List *shardCommandList,
 															char *targetNodeName,
@@ -154,6 +164,8 @@ static List * CreateShardMoveLogicalRepTargetList(HTAB *publicationInfoHash,
 static void WaitForGroupedLogicalRepTargetsToCatchUp(XLogRecPtr sourcePosition,
 													 GroupedLogicalRepTargets *
 													 groupedLogicalRepTargets);
+static void CreateEarlyExistingIndexesForLogicalReplication(List *shardList,
+															WorkerNode *targetNode);
 
 /*
  * LogicallyReplicateShards replicates a list of shards from one node to another
@@ -265,6 +277,18 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 	CloseConnection(sourceReplicationConnection);
 
 	/*
+	 * Optionally build one of each table's existing usable indexes early on the
+	 * destination shards (before the catch-up below), so that the subscriber can use
+	 * an index scan while it applies the changes that accumulate during catch-up.
+	 * Unlike the temporary helper index above, this reuses one of the table's own
+	 * indexes and keeps it permanently (it is excluded from the late CREATE INDEX
+	 * phase instead of being dropped). It only does something for tables that have a
+	 * usable index but no replica identity / primary key index, and only when
+	 * explicitly enabled via citus.create_existing_indexes_early_for_logical_replication.
+	 */
+	CreateEarlyExistingIndexesForLogicalReplication(shardList, targetNode);
+
+	/*
 	 * Start the replication and copy all data
 	 */
 	CompleteNonBlockingShardTransfer(shardList,
@@ -283,6 +307,69 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 	 */
 	CloseGroupedLogicalRepTargetsConnections(groupedLogicalRepTargetsHash);
 	CloseConnection(sourceConnection);
+}
+
+
+/*
+ * CreateEarlyExistingIndexesForLogicalReplication builds, for each shard in the
+ * given list, one of the table's existing usable indexes early on the destination
+ * shard -- before the catch-up phase of the logical-replication based move -- so that
+ * the subscriber can use an index scan (instead of a sequential scan) while it applies
+ * the changes that accumulate during catch-up.
+ *
+ * Unlike the temporary helper index built by CreateTemporaryReplicaIdentityFullIndexes,
+ * this reuses one of the table's own indexes (chosen by ChooseExistingIndexToBuildEarly)
+ * and keeps it permanently: the index is instead excluded from the late CREATE INDEX
+ * phase (see ExecuteCreateIndexCommands), so it is created exactly once. The command is
+ * produced by GetEarlyBuiltIndexCommandList, which uses the same code path as the late
+ * phase, so the two are byte-for-byte consistent.
+ *
+ * This is gated by citus.create_existing_indexes_early_for_logical_replication and is a
+ * no-op unless that setting is enabled. It only ever touches the destination shard,
+ * which is not yet visible to users, so a plain (blocking) CREATE INDEX is safe.
+ */
+static void
+CreateEarlyExistingIndexesForLogicalReplication(List *shardList, WorkerNode *targetNode)
+{
+	if (!CreateExistingIndexesEarlyForLogicalReplication)
+	{
+		return;
+	}
+
+	ShardInterval *shardInterval = NULL;
+	foreach_declared_ptr(shardInterval, shardList)
+	{
+		Oid relationId = shardInterval->relationId;
+
+		List *tableCreateIndexCommandList = GetEarlyBuiltIndexCommandList(relationId);
+		if (tableCreateIndexCommandList == NIL)
+		{
+			/*
+			 * The table has no index eligible to be built early (e.g. it already has
+			 * a replica identity / primary key index that Citus builds early anyway,
+			 * or it has no usable plain btree at all).
+			 */
+			continue;
+		}
+
+		List *shardCreateIndexCommandList =
+			WorkerApplyShardDDLCommandList(tableCreateIndexCommandList,
+										   shardInterval->shardId);
+
+		ereport(DEBUG1, (errmsg("building existing index early on shard "
+								UINT64_FORMAT " on node %s:%d",
+								shardInterval->shardId,
+								targetNode->workerName, targetNode->workerPort)));
+
+		/*
+		 * The destination shard is not yet visible to users, so a plain (blocking)
+		 * CREATE INDEX is safe and cheaper than CONCURRENTLY. We mirror the way
+		 * ExecuteCreateIndexCommands builds indexes on the target node.
+		 */
+		SendCommandListToWorkerOutsideTransaction(
+			targetNode->workerName, targetNode->workerPort,
+			TableOwner(relationId), shardCreateIndexCommandList);
+	}
 }
 
 
@@ -690,7 +777,7 @@ CreatePostLogicalReplicationDataLoadObjects(List *logicalRepTargetList,
 	 *  table and setting the statistics of indexes, depends on the indexes being
 	 *  created. That's why the execution is divided into four distinct stages.
 	 */
-	ExecuteCreateIndexCommands(logicalRepTargetList);
+	ExecuteCreateIndexCommands(logicalRepTargetList, type);
 	ExecuteCreateConstraintsBackedByIndexCommands(logicalRepTargetList);
 	ExecuteClusterOnCommands(logicalRepTargetList);
 	ExecuteCreateIndexStatisticsCommands(logicalRepTargetList);
@@ -720,7 +807,7 @@ CreatePostLogicalReplicationDataLoadObjects(List *logicalRepTargetList,
  * commands fail.
  */
 static void
-ExecuteCreateIndexCommands(List *logicalRepTargetList)
+ExecuteCreateIndexCommands(List *logicalRepTargetList, LogicalRepType type)
 {
 	List *taskList = NIL;
 	LogicalRepTarget *target = NULL;
@@ -731,9 +818,28 @@ ExecuteCreateIndexCommands(List *logicalRepTargetList)
 		{
 			Oid relationId = shardInterval->relationId;
 
-			List *tableCreateIndexCommandList =
-				GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(relationId,
-																		   INCLUDE_CREATE_INDEX_STATEMENTS);
+			/*
+			 * For a shard move we may have built one of the table's existing indexes
+			 * early on the destination shard (see
+			 * CreateEarlyExistingIndexesForLogicalReplication); if so, that index must
+			 * be excluded here so it is not created a second time. For a shard split we
+			 * never build indexes early, so we use the regular exclusion. Both variants
+			 * only ever additionally skip the index backing the replica identity.
+			 */
+			List *tableCreateIndexCommandList = NIL;
+			if (type == SHARD_MOVE)
+			{
+				tableCreateIndexCommandList =
+					GetTableIndexAndConstraintCommandsExcludingReplicaIdentityAndEarlyBuiltIndex
+					(
+						relationId, INCLUDE_CREATE_INDEX_STATEMENTS);
+			}
+			else
+			{
+				tableCreateIndexCommandList =
+					GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(
+						relationId, INCLUDE_CREATE_INDEX_STATEMENTS);
+			}
 
 			List *shardCreateIndexCommandList =
 				WorkerApplyShardDDLCommandList(tableCreateIndexCommandList,

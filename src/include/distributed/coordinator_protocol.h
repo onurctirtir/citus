@@ -241,6 +241,10 @@ extern List * GetTableRowLevelSecurityCommands(Oid relationId);
 extern List * GetTableIndexAndConstraintCommands(Oid relationId, int indexFlags);
 extern List * GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(Oid relationId,
 																		 int indexFlags);
+extern List * GetTableIndexAndConstraintCommandsExcludingReplicaIdentityAndEarlyBuiltIndex
+	(Oid relationId, int indexFlags);
+extern Oid ChooseExistingIndexToBuildEarly(Oid relationId);
+extern List * GetEarlyBuiltIndexCommandList(Oid relationId);
 extern Oid GetRelationIdentityOrPK(Relation rel);
 extern void GatherIndexAndConstraintDefinitionList(Form_pg_index indexForm,
 												   List **indexDDLEventList,

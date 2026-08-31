@@ -32,6 +32,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
@@ -51,6 +52,7 @@
 #include "utils/palloc.h"
 #include "utils/relcache.h"
 #include "utils/ruleutils.h"
+#include "utils/syscache.h"
 #include "utils/varlena.h"
 
 #include "pg_version_constants.h"
@@ -63,6 +65,8 @@
 #include "distributed/lock_graph.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
+#include "distributed/multi_logical_replication.h"
+#include "distributed/multi_partitioning_utils.h"
 #include "distributed/namespace_utils.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/remote_commands.h"
@@ -86,6 +90,9 @@ static void GatherIndexAndConstraintDefinitionListExcludingReplicaIdentity(Form_
 																		   indexDDLEventList,
 																		   int
 																		   indexFlags);
+static void
+GatherIndexAndConstraintDefinitionListExcludingReplicaIdentityAndEarlyBuiltIndex(
+	Form_pg_index indexForm, List **indexDDLEventList, int indexFlags);
 static Datum WorkerNodeGetDatum(WorkerNode *workerNode, TupleDesc tupleDescriptor);
 
 static char * CitusCreateAlterColumnarTableSet(char *qualifiedRelationName,
@@ -890,6 +897,206 @@ GatherIndexAndConstraintDefinitionListExcludingReplicaIdentity(Form_pg_index ind
 	GatherIndexAndConstraintDefinitionList(indexForm, indexDDLEventList, indexFlags);
 
 	table_close(relation, NoLock);
+}
+
+
+/*
+ * GetTableIndexAndConstraintCommandsExcludingReplicaIdentityAndEarlyBuiltIndex
+ * behaves like GetTableIndexAndConstraintCommandsExcludingReplicaIdentity but, in
+ * addition to the index backing the replica identity, it also excludes the single
+ * existing index that Citus builds early on the destination shard of a
+ * logical-replication based move (see ChooseExistingIndexToBuildEarly). This is
+ * used only for the CREATE INDEX phase of the move so that we do not attempt to
+ * create that index a second time; the CLUSTER and STATISTICS phases still process
+ * it, because the index already exists on the destination shard at that point.
+ */
+List *
+GetTableIndexAndConstraintCommandsExcludingReplicaIdentityAndEarlyBuiltIndex(Oid
+																			 relationId,
+																			 int
+																			 indexFlags)
+{
+	return ExecuteFunctionOnEachTableIndex(
+		relationId,
+		GatherIndexAndConstraintDefinitionListExcludingReplicaIdentityAndEarlyBuiltIndex,
+		indexFlags);
+}
+
+
+/*
+ * GatherIndexAndConstraintDefinitionListExcludingReplicaIdentityAndEarlyBuiltIndex is
+ * a wrapper around GatherIndexAndConstraintDefinitionList() which excludes both the
+ * index backing the replica identity and the existing index that Citus built early on
+ * the destination shard (only when that behavior is enabled via
+ * citus.create_existing_indexes_early_for_logical_replication).
+ */
+static void
+GatherIndexAndConstraintDefinitionListExcludingReplicaIdentityAndEarlyBuiltIndex(
+	Form_pg_index indexForm, List **indexDDLEventList, int indexFlags)
+{
+	Oid relationId = indexForm->indrelid;
+	Relation relation = table_open(relationId, AccessShareLock);
+
+	Oid replicaIdentityIndex = GetRelationIdentityOrPK(relation);
+
+	if (replicaIdentityIndex == indexForm->indexrelid)
+	{
+		/* this index is backing the replica identity, so skip */
+		table_close(relation, NoLock);
+		return;
+	}
+
+	if (CreateExistingIndexesEarlyForLogicalReplication &&
+		ChooseExistingIndexToBuildEarly(relationId) == indexForm->indexrelid)
+	{
+		/*
+		 * We already built this index early on the destination shard, so skip it
+		 * here to avoid creating it a second time.
+		 */
+		table_close(relation, NoLock);
+		return;
+	}
+
+	GatherIndexAndConstraintDefinitionList(indexForm, indexDDLEventList, indexFlags);
+
+	table_close(relation, NoLock);
+}
+
+
+/*
+ * ChooseExistingIndexToBuildEarly returns the OID of the existing index that Citus
+ * should build early on the destination shard of a logical-replication based move,
+ * so that the subscriber can use an index scan while it applies the changes that
+ * accumulate during the catch-up phase. It returns InvalidOid when there is no such
+ * index, in which case nothing is built early and the table's indexes are created in
+ * the normal late post-load phase.
+ *
+ * We only do this for a table that does not already have an index backing its replica
+ * identity or primary key: such an index is built on the destination shard before the
+ * catch-up anyway (see CreateReplicaIdentities), so its catch-up is already
+ * index-assisted. Partitioned parents hold no data of their own, so we skip them.
+ *
+ * Among the remaining tables we consider only a plain index (not one backing a
+ * UNIQUE/EXCLUDE constraint or primary key, which are (re)created in the late
+ * constraint phase) that a subscriber can use under REPLICA IDENTITY FULL: a valid,
+ * live, non-partial btree whose leftmost key is a plain column. To keep the choice
+ * deterministic and independent of the source shard's statistics, we pick the
+ * eligible index with the lowest OID. Both the early build and the late exclusion
+ * call this function, so they always agree on the same index.
+ */
+Oid
+ChooseExistingIndexToBuildEarly(Oid relationId)
+{
+	if (PartitionedTable(relationId))
+	{
+		return InvalidOid;
+	}
+
+	Relation relation = RelationIdGetRelation(relationId);
+	if (relation == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("could not open relation with OID %u", relationId)));
+	}
+
+	if (OidIsValid(GetRelationIdentityOrPK(relation)))
+	{
+		/*
+		 * The table has an index backing its replica identity or primary key, which
+		 * Citus already builds early, so there is nothing extra to build here.
+		 */
+		RelationClose(relation);
+		return InvalidOid;
+	}
+
+	List *indexOidList = RelationGetIndexList(relation);
+	Oid chosenIndexOid = InvalidOid;
+
+	Oid indexOid = InvalidOid;
+	foreach_declared_oid(indexOid, indexOidList)
+	{
+		HeapTuple indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexOid));
+		if (!HeapTupleIsValid(indexTuple))
+		{
+			continue;
+		}
+
+		Form_pg_index indexForm = (Form_pg_index) GETSTRUCT(indexTuple);
+
+		bool isValidIndex = indexForm->indisvalid && indexForm->indislive;
+
+		/* a partial index (with a WHERE clause) cannot be used */
+		bool isPartial = !heap_attisnull(indexTuple, Anum_pg_index_indpred, NULL);
+
+		/* the leftmost index field must be a plain column, not an expression */
+		bool leftmostFieldIsColumn =
+			AttributeNumberIsValid(indexForm->indkey.values[0]);
+
+		/*
+		 * Skip indexes that back a constraint (primary key, unique, exclusion); those
+		 * are (re)created in the late constraint phase, and we do not want to reorder
+		 * a constraint.
+		 */
+		bool impliedByConstraint = IndexImpliedByAConstraint(indexForm);
+
+		/*
+		 * Determine the index access method. We read relam from the pg_class syscache
+		 * rather than using get_rel_relam(), which only exists on PostgreSQL 17+.
+		 */
+		Oid indexAmOid = InvalidOid;
+		HeapTuple classTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(indexOid));
+		if (HeapTupleIsValid(classTuple))
+		{
+			indexAmOid = ((Form_pg_class) GETSTRUCT(classTuple))->relam;
+			ReleaseSysCache(classTuple);
+		}
+
+		if (isValidIndex && !isPartial && leftmostFieldIsColumn &&
+			!impliedByConstraint && indexAmOid == BTREE_AM_OID)
+		{
+			if (!OidIsValid(chosenIndexOid) || indexOid < chosenIndexOid)
+			{
+				chosenIndexOid = indexOid;
+			}
+		}
+
+		ReleaseSysCache(indexTuple);
+	}
+
+	RelationClose(relation);
+
+	return chosenIndexOid;
+}
+
+
+/*
+ * GetEarlyBuiltIndexCommandList returns a single-element list containing the
+ * TableDDLCommand that creates the existing index chosen by
+ * ChooseExistingIndexToBuildEarly() for the given relation, or NIL when there is no
+ * such index. The command is produced exactly like the late CREATE INDEX phase
+ * (see GatherIndexAndConstraintDefinitionList): pg_get_indexdef_string() under an
+ * empty search path, wrapped with makeTableDDLCommandString(). This guarantees that
+ * building the index early and excluding it from the late phase operate on a
+ * byte-for-byte identical command.
+ */
+List *
+GetEarlyBuiltIndexCommandList(Oid relationId)
+{
+	Oid indexId = ChooseExistingIndexToBuildEarly(relationId);
+	if (!OidIsValid(indexId))
+	{
+		return NIL;
+	}
+
+	/* generate fully-qualified names, exactly as the late phase does */
+	int saveNestLevel = PushEmptySearchPath();
+
+	char *statementDef = pg_get_indexdef_string(indexId);
+	List *commandList = list_make1(makeTableDDLCommandString(statementDef));
+
+	PopEmptySearchPath(saveNestLevel);
+
+	return commandList;
 }
 
 
