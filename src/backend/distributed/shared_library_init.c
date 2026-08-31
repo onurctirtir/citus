@@ -1190,6 +1190,25 @@ RegisterCitusConfigVariables(void)
 		GUC_STANDARD,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"citus.create_existing_indexes_early_for_logical_replication",
+		gettext_noop("Builds a table's existing subscriber-usable index on the "
+					 "destination shard early during a logical-replication based "
+					 "shard transfer."),
+		gettext_noop("When enabled, if a table lacks an early-built replica "
+					 "identity index (no primary key and no REPLICA IDENTITY USING "
+					 "INDEX) but has an existing index the subscriber can use under "
+					 "REPLICA IDENTITY FULL, Citus builds that index on the "
+					 "destination shard right after the initial data copy instead of "
+					 "in the late post-load phase. This lets the subscriber use an "
+					 "index scan during the bulk catch-up. The index is a regular "
+					 "index that the destination shard keeps."),
+		&CreateExistingIndexesEarlyForLogicalReplication,
+		false,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
 	DefineCustomEnumVariable(
 		"citus.create_object_propagation",
 		gettext_noop("Controls the behavior of CREATE statements in transactions for "

@@ -36,6 +36,14 @@ extern bool PlacementMovedUsingLogicalReplicationInTX;
 extern bool SetReplicaIdentityFullForLogicalReplication;
 
 /*
+ * When enabled, Citus builds a table's existing subscriber-usable index on the
+ * destination shard early (right after the initial COPY) instead of in the late
+ * post-load phase, so the subscriber can use an index scan during the bulk
+ * catch-up of a logical-replication based transfer. Defaults to off.
+ */
+extern bool CreateExistingIndexesEarlyForLogicalReplication;
+
+/*
  * NodeAndOwner should be used as a key for structs that should be hashed by a
  * combination of node and owner.
  */
