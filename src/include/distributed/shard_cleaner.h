@@ -51,7 +51,17 @@ typedef enum CleanupObject
 	 * objects (publication/subscription/slot) so that the identity is only restored
 	 * once those are dropped.
 	 */
-	CLEANUP_OBJECT_REPLICA_IDENTITY = 7
+	CLEANUP_OBJECT_REPLICA_IDENTITY = 7,
+
+	/*
+	 * A temporary "helper" index built on the destination shard of a
+	 * logical-replication based transfer for a table that lacks both a replica
+	 * identity and a usable index (see CreateTemporaryReplicaIdentityFullIndexes).
+	 * The cleanup drops the index once the transfer completes. On failure the
+	 * destination shard placement (which sorts earlier) is dropped along with the
+	 * index anyway, so the drop below uses IF EXISTS.
+	 */
+	CLEANUP_OBJECT_INDEX = 8
 } CleanupObject;
 
 /*

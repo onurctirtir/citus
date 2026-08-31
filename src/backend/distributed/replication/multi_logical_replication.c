@@ -21,9 +21,11 @@
 #include "access/sysattr.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_subscription_rel.h"
 #include "commands/dbcommands.h"
+#include "commands/defrem.h"
 #include "common/hashfn.h"
 #include "nodes/bitmapset.h"
 #include "parser/scansup.h"
@@ -106,6 +108,15 @@ static const char *subscriptionRolePrefix[] = {
 int LogicalReplicationTimeout = 2 * 60 * 60 * 1000;
 
 /*
+ * GUC variable. When true, Citus builds a temporary "helper" index on the
+ * destination shard during a logical-replication based transfer for tables that
+ * lack both a replica identity and a usable index, so that the subscriber can
+ * use an index scan (instead of a sequential scan) while applying changes. The
+ * index is dropped once the transfer completes. Defaults to off.
+ */
+bool CreateTemporaryIndexesForLogicalReplication = false;
+
+/*
  * GUC variable. When true, before publishing the source shards of a
  * logical-replication based transfer, Citus sets REPLICA IDENTITY FULL on the
  * source shard of any table that has neither a replica identity nor a primary
@@ -164,8 +175,13 @@ static List * CreateShardMoveLogicalRepTargetList(HTAB *publicationInfoHash,
 static void WaitForGroupedLogicalRepTargetsToCatchUp(XLogRecPtr sourcePosition,
 													 GroupedLogicalRepTargets *
 													 groupedLogicalRepTargets);
+static void CreateTemporaryReplicaIdentityFullIndexes(List *shardList,
+													  MultiConnection *sourceConnection,
+													  WorkerNode *targetNode);
 static void CreateEarlyExistingIndexesForLogicalReplication(List *shardList,
 															WorkerNode *targetNode);
+static char * ChooseHelperIndexColumn(MultiConnection *sourceConnection,
+									  ShardInterval *shardInterval);
 
 /*
  * LogicallyReplicateShards replicates a list of shards from one node to another
@@ -277,6 +293,17 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 	CloseConnection(sourceReplicationConnection);
 
 	/*
+	 * Optionally build a temporary helper index on the destination shards so that
+	 * the subscriber can use an index scan (instead of a sequential scan) while
+	 * applying the changes that are replicated during the catch-up below. This only
+	 * does something for tables that have neither a replica identity nor a usable
+	 * index, and only when explicitly enabled via
+	 * citus.create_temporary_indexes_for_logical_replication. It must run before the
+	 * subscriptions are enabled (which happens in CompleteNonBlockingShardTransfer).
+	 */
+	CreateTemporaryReplicaIdentityFullIndexes(shardList, sourceConnection, targetNode);
+
+	/*
 	 * Optionally build one of each table's existing usable indexes early on the
 	 * destination shards (before the catch-up below), so that the subscriber can use
 	 * an index scan while it applies the changes that accumulate during catch-up.
@@ -307,6 +334,117 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 	 */
 	CloseGroupedLogicalRepTargetsConnections(groupedLogicalRepTargetsHash);
 	CloseConnection(sourceConnection);
+}
+
+
+/*
+ * CreateTemporaryReplicaIdentityFullIndexes builds a temporary "helper" btree index
+ * on the destination shard for each shard whose distributed table would otherwise
+ * force the logical-replication subscriber to sequential-scan the destination during
+ * catch-up, i.e. the table has no index the subscriber can use -- regardless of
+ * whether it has REPLICA IDENTITY FULL (either set by the user, or set by Citus on
+ * the source shard for a table without a replica identity; see
+ * PrepareReplicaIdentitiesForPublication).
+ *
+ * When such a table is transferred with logical replication, its source shard is
+ * published with REPLICA IDENTITY FULL. With no index on the destination shard the
+ * subscriber has to locate every updated/deleted row with a sequential scan while it
+ * applies the changes that accumulate during the catch-up phase, which can be very
+ * slow on large shards. Building a single-column btree lets the subscriber use an
+ * index scan instead.
+ *
+ * The column is chosen from the source shard's planner statistics (see
+ * ChooseHelperIndexColumn). The index is registered with the resource cleanup
+ * framework (CLEANUP_OBJECT_INDEX, CLEANUP_ALWAYS) before it is created, so it is
+ * dropped once the transfer completes, whether it succeeds or fails. On a failed
+ * transfer the destination shard placement itself is dropped first (it sorts before
+ * the index in the cleanup order), and the DROP INDEX IF EXISTS then becomes a no-op.
+ *
+ * This is gated by citus.create_temporary_indexes_for_logical_replication and is a
+ * no-op unless that setting is enabled. It only ever touches the destination shard,
+ * which is not yet visible to users, so a plain (blocking) CREATE INDEX is safe.
+ */
+static void
+CreateTemporaryReplicaIdentityFullIndexes(List *shardList,
+										  MultiConnection *sourceConnection,
+										  WorkerNode *targetNode)
+{
+	if (!CreateTemporaryIndexesForLogicalReplication)
+	{
+		return;
+	}
+
+	ShardInterval *shardInterval = NULL;
+	foreach_declared_ptr(shardInterval, shardList)
+	{
+		Oid relationId = shardInterval->relationId;
+
+		/*
+		 * Partitioned tables hold no data of their own, and tables that already
+		 * have an index the subscriber can use -- a primary key / replica identity
+		 * index (which Citus builds on the destination shard before the catch-up,
+		 * see CreateReplicaIdentities), or any other usable btree -- let it locate
+		 * rows efficiently, so there is nothing to build for them.
+		 *
+		 * We deliberately do NOT skip tables that merely have REPLICA IDENTITY FULL
+		 * without such an index: the publisher accepts their modifications, but the
+		 * subscriber would still have to sequential-scan the destination shard for
+		 * every change during catch-up, which is exactly what the helper index
+		 * avoids.
+		 */
+		if (PartitionedTable(relationId) ||
+			RelationHasUsableReplicaIdentityFullIndex(relationId))
+		{
+			continue;
+		}
+
+		char *columnName = ChooseHelperIndexColumn(sourceConnection, shardInterval);
+		if (columnName == NULL)
+		{
+			/*
+			 * No column is eligible for a btree index (e.g. no column type has a
+			 * default btree operator class). Fall back to today's behavior, i.e. a
+			 * sequential scan on the subscriber.
+			 */
+			ereport(DEBUG1, (errmsg("no suitable column found to build a temporary "
+									"replica identity helper index for shard "
+									UINT64_FORMAT, shardInterval->shardId)));
+			continue;
+		}
+
+		char *qualifiedShardName = ConstructQualifiedShardName(shardInterval);
+		char *indexName = psprintf("citus_ri_helper_" UINT64_FORMAT,
+								   shardInterval->shardId);
+		char *schemaName = get_namespace_name(get_rel_namespace(relationId));
+		char *qualifiedIndexName = quote_qualified_identifier(schemaName, indexName);
+
+		/*
+		 * Register the cleanup record before creating the index so that it is
+		 * dropped even if we crash right after the CREATE INDEX below.
+		 */
+		InsertCleanupRecordOutsideTransaction(CLEANUP_OBJECT_INDEX,
+											  qualifiedIndexName,
+											  targetNode->groupId,
+											  CLEANUP_ALWAYS);
+
+		ereport(DEBUG1, (errmsg("building temporary replica identity helper index "
+								"on column \"%s\" of shard " UINT64_FORMAT
+								" on node %s:%d",
+								columnName, shardInterval->shardId,
+								targetNode->workerName, targetNode->workerPort)));
+
+		/*
+		 * The destination shard is not yet visible to users, so a plain (blocking)
+		 * CREATE INDEX is safe and cheaper than CONCURRENTLY. We mirror the way
+		 * CreateReplicaIdentitiesOnNode builds indexes on the target node.
+		 */
+		SendCommandListToWorkerOutsideTransaction(
+			targetNode->workerName, targetNode->workerPort,
+			TableOwner(relationId),
+			list_make1(psprintf("CREATE INDEX %s ON %s USING btree (%s)",
+								quote_identifier(indexName), qualifiedShardName,
+								quote_identifier(columnName))));
+	}
 }
 
 
@@ -370,6 +508,107 @@ CreateEarlyExistingIndexesForLogicalReplication(List *shardList, WorkerNode *tar
 			targetNode->workerName, targetNode->workerPort,
 			TableOwner(relationId), shardCreateIndexCommandList);
 	}
+}
+
+
+/*
+ * ChooseHelperIndexColumn picks the column of the given shard's table that is most
+ * useful to build a temporary replica-identity helper index on. It returns the column
+ * name or NULL if the table has no column that can back a btree index.
+ *
+ * Only columns whose type has a default btree operator class are eligible; this is the
+ * same test CREATE INDEX applies (and correctly handles binary-coercible cases such as
+ * varchar mapping to text_ops), so we never propose a column that would fail to index.
+ * Among the eligible columns we prefer the most selective one according to the source
+ * shard's planner statistics (pg_statistic.stadistinct); if statistics are not
+ * available (the shard was never analyzed) we deterministically fall back to the first
+ * eligible column.
+ */
+static char *
+ChooseHelperIndexColumn(MultiConnection *sourceConnection, ShardInterval *shardInterval)
+{
+	Oid relationId = shardInterval->relationId;
+	Relation relation = table_open(relationId, AccessShareLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(relation);
+
+	StringInfo eligibleAttNums = makeStringInfo();
+	char *firstEligibleColumn = NULL;
+	bool foundEligible = false;
+
+	for (int attributeIndex = 0; attributeIndex < tupleDescriptor->natts; attributeIndex++
+		 )
+	{
+		Form_pg_attribute attributeForm = TupleDescAttr(tupleDescriptor, attributeIndex);
+
+		if (attributeForm->attisdropped || attributeForm->attnum <= 0)
+		{
+			continue;
+		}
+
+		/* the column type must have a default btree operator class to be indexable */
+		Oid opclass = GetDefaultOpClass(attributeForm->atttypid, BTREE_AM_OID);
+		if (!OidIsValid(opclass))
+		{
+			continue;
+		}
+
+		if (foundEligible)
+		{
+			appendStringInfoChar(eligibleAttNums, ',');
+		}
+		else
+		{
+			firstEligibleColumn = pstrdup(NameStr(attributeForm->attname));
+		}
+		appendStringInfo(eligibleAttNums, "%d", attributeForm->attnum);
+		foundEligible = true;
+	}
+
+	table_close(relation, NoLock);
+
+	if (!foundEligible)
+	{
+		return NULL;
+	}
+
+	/*
+	 * Ask the source shard which eligible column is the most selective according to
+	 * its statistics. We normalize stadistinct (negative values are a fraction of the
+	 * row count, positive values are an absolute count) and give unanalyzed columns a
+	 * score of 0 so that, in the absence of statistics, we fall back to the first
+	 * eligible column (lowest attnum). The query runs on the source connection because
+	 * the source shard holds both the data and the user's ANALYZE statistics.
+	 */
+	char *qualifiedShardName = ConstructQualifiedShardName(shardInterval);
+	char *statsQuery = psprintf(
+		"SELECT a.attname FROM pg_catalog.pg_attribute a "
+		"JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
+		"LEFT JOIN pg_catalog.pg_statistic s "
+		"ON s.starelid = a.attrelid AND s.staattnum = a.attnum "
+		"WHERE a.attrelid = %s::regclass AND a.attnum = ANY(ARRAY[%s]) "
+		"ORDER BY (CASE WHEN s.stadistinct IS NULL THEN 0 "
+		"WHEN s.stadistinct < 0 THEN -s.stadistinct "
+		"WHEN c.reltuples > 0 THEN s.stadistinct / c.reltuples "
+		"ELSE 0 END) DESC, a.attnum LIMIT 1",
+		quote_literal_cstr(qualifiedShardName), eligibleAttNums->data);
+
+	char *chosenColumn = firstEligibleColumn;
+
+	int querySent = SendRemoteCommand(sourceConnection, statsQuery);
+	if (querySent != 0)
+	{
+		bool raiseInterrupts = false;
+		PGresult *result = GetRemoteCommandResult(sourceConnection, raiseInterrupts);
+		if (IsResponseOK(result) && PQntuples(result) == 1 &&
+			PQnfields(result) == 1 && !PQgetisnull(result, 0, 0))
+		{
+			chosenColumn = pstrdup(PQgetvalue(result, 0, 0));
+		}
+		PQclear(result);
+		ForgetResults(sourceConnection);
+	}
+
+	return chosenColumn;
 }
 
 

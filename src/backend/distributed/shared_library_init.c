@@ -1228,6 +1228,27 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		"citus.create_temporary_indexes_for_logical_replication",
+		gettext_noop("Builds a temporary index on the destination shard during a "
+					 "logical replication based shard transfer for tables that lack "
+					 "both a replica identity and a usable index."),
+		gettext_noop("When Citus transfers a shard of a table that has neither a "
+					 "replica identity nor an index usable under REPLICA IDENTITY "
+					 "FULL, the logical replication subscriber has to locate rows "
+					 "with a sequential scan, which can be slow. With this setting "
+					 "enabled Citus builds a temporary btree index (on a column "
+					 "chosen from the source shard's statistics) on the destination "
+					 "shard so that the subscriber can use an index scan instead. "
+					 "The index is dropped once the transfer completes. This also "
+					 "allows such tables to be transferred using the automatic "
+					 "shard_transfer_mode."),
+		&CreateTemporaryIndexesForLogicalReplication,
+		false,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		"citus.defer_drop_after_shard_move",
 		gettext_noop("Deprecated, Citus always defers drop after shard move"),
 		NULL,
