@@ -1482,21 +1482,23 @@ VerifyTablesHaveReplicaIdentity(List *colocatedTableList)
 	{
 		Oid colocatedTableId = lfirst_oid(colocatedTableCell);
 
-		if (!RelationCanPublishAllModifications(colocatedTableId))
+		if (RelationCanPublishAllModifications(colocatedTableId))
 		{
-			char *colocatedRelationName = get_rel_name(colocatedTableId);
-
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("cannot use logical replication to transfer shards of "
-								   "the relation %s since it doesn't have a REPLICA "
-								   "IDENTITY or PRIMARY KEY", colocatedRelationName),
-							errdetail("UPDATE and DELETE commands on the shard will "
-									  "error out during logical replication unless "
-									  "there is a REPLICA IDENTITY or PRIMARY KEY."),
-							errhint("If you wish to continue without a replica "
-									"identity set the shard_transfer_mode to "
-									"'force_logical' or 'block_writes'.")));
+			continue;
 		}
+
+		char *colocatedRelationName = get_rel_name(colocatedTableId);
+
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot use logical replication to transfer shards of "
+							   "the relation %s since it doesn't have a REPLICA "
+							   "IDENTITY or PRIMARY KEY", colocatedRelationName),
+						errdetail("UPDATE and DELETE commands on the shard will "
+								  "error out during logical replication unless "
+								  "there is a REPLICA IDENTITY or PRIMARY KEY."),
+						errhint("If you wish to continue without a replica "
+								"identity set the shard_transfer_mode to "
+								"'force_logical' or 'block_writes'.")));
 	}
 }
 
