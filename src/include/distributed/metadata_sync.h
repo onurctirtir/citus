@@ -32,6 +32,7 @@ extern int MetadataSyncRetryInterval;
 extern int MetadataSyncTransMode;
 extern int MetadataSyncCacheFlushInterval;
 extern int MetadataSyncPoolTaskSize;
+extern int MetadataSyncSetBatchSize;
 extern bool MetadataSyncUsePool;
 extern bool MetadataSyncReleaseDeparseLocks;
 extern bool MetadataSyncPoolSkipExecute;
