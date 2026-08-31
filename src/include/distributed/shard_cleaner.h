@@ -42,7 +42,16 @@ typedef enum CleanupObject
 	CLEANUP_OBJECT_REPLICATION_SLOT = 3,
 	CLEANUP_OBJECT_PUBLICATION = 4,
 	CLEANUP_OBJECT_USER = 5,
-	CLEANUP_OBJECT_DATABASE = 6
+	CLEANUP_OBJECT_DATABASE = 6,
+
+	/*
+	 * A shard whose REPLICA IDENTITY was temporarily set to FULL so that it could
+	 * publish UPDATE/DELETE during a logical-replication based transfer. The cleanup
+	 * restores the original replica identity. This must sort AFTER the replication
+	 * objects (publication/subscription/slot) so that the identity is only restored
+	 * once those are dropped.
+	 */
+	CLEANUP_OBJECT_REPLICA_IDENTITY = 7
 } CleanupObject;
 
 /*

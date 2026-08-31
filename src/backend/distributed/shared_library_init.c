@@ -2559,6 +2559,26 @@ RegisterCitusConfigVariables(void)
 		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"citus.set_replica_identity_full_for_logical_replication",
+		gettext_noop("Temporarily sets REPLICA IDENTITY FULL on the source shard of "
+					 "a table that has no replica identity during a "
+					 "logical-replication based shard transfer."),
+		gettext_noop("A table that has neither a replica identity nor a primary key "
+					 "cannot publish its UPDATE/DELETE commands, so the publisher "
+					 "rejects such writes while the table is being transferred with "
+					 "logical replication. When enabled, Citus sets REPLICA IDENTITY "
+					 "FULL on the source shard of such a table before publishing it, "
+					 "making its writes publishable, and restores the original "
+					 "replica identity once the transfer completes (or via the "
+					 "cleanup daemon on failure). When disabled, Citus never changes "
+					 "a shard's replica identity."),
+		&SetReplicaIdentityFullForLogicalReplication,
+		false,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		"citus.shard_count",
 		gettext_noop("Sets the number of shards for a new hash-partitioned table "

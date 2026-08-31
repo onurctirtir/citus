@@ -1470,8 +1470,18 @@ ErrorIfMoveUnsupportedTableType(Oid relationId)
 
 /*
  * VerifyTablesHaveReplicaIdentity throws an error if any of the tables
- * do not have a replica identity, which is required for logical replication
- * to replicate UPDATE and DELETE commands.
+ * cannot be safely transferred using logical replication in the automatic
+ * shard transfer mode.
+ *
+ * Logical replication needs to be able to publish UPDATE and DELETE commands. A
+ * table that has a REPLICA IDENTITY or PRIMARY KEY satisfies this directly. A
+ * table that has neither cannot publish its UPDATE/DELETE, so the publisher would
+ * reject the user's concurrent writes during the transfer -- unless Citus is
+ * allowed to temporarily set REPLICA IDENTITY FULL on the source shard, which is
+ * exactly what citus.set_replica_identity_full_for_logical_replication enables
+ * (see PrepareReplicaIdentitiesForPublication). Therefore, in the automatic mode
+ * we admit a replica-identity-less table only when that setting is on; otherwise
+ * we refuse it and direct the user to force_logical or block_writes.
  */
 void
 VerifyTablesHaveReplicaIdentity(List *colocatedTableList)
@@ -1483,6 +1493,16 @@ VerifyTablesHaveReplicaIdentity(List *colocatedTableList)
 		Oid colocatedTableId = lfirst_oid(colocatedTableCell);
 
 		if (RelationCanPublishAllModifications(colocatedTableId))
+		{
+			continue;
+		}
+
+		/*
+		 * The table has no replica identity. It can only be transferred with
+		 * logical replication if Citus is allowed to set REPLICA IDENTITY FULL on
+		 * its source shard, which makes its UPDATE/DELETE publishable.
+		 */
+		if (SetReplicaIdentityFullForLogicalReplication)
 		{
 			continue;
 		}

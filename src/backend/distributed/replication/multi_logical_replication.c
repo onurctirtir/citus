@@ -105,6 +105,19 @@ static const char *subscriptionRolePrefix[] = {
 /* GUC variable, defaults to 2 hours */
 int LogicalReplicationTimeout = 2 * 60 * 60 * 1000;
 
+/*
+ * GUC variable. When true, before publishing the source shards of a
+ * logical-replication based transfer, Citus sets REPLICA IDENTITY FULL on the
+ * source shard of any table that has neither a replica identity nor a primary
+ * key, so that the table's UPDATE/DELETE commands become publishable. Without
+ * this the publisher rejects UPDATE/DELETE on such a table, which would break
+ * the user's concurrent writes for the duration of the transfer. The original
+ * replica identity is restored on completion (or by the cleanup daemon on
+ * failure). Defaults to off, in which case Citus never changes a shard's replica
+ * identity and behaves exactly as it did before this setting existed.
+ */
+bool SetReplicaIdentityFullForLogicalReplication = false;
+
 
 /* see the comment in master_move_shard_placement */
 bool PlacementMovedUsingLogicalReplicationInTX = false;
@@ -199,6 +212,7 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 		GetReplicationConnection(sourceConnection->hostname, sourceConnection->port);
 
 	/* set up the publication on the source and subscription on the target */
+	PrepareReplicaIdentitiesForPublication(sourceConnection, publicationInfoHash);
 	CreatePublications(sourceConnection, publicationInfoHash);
 	char *snapshot = CreateReplicationSlots(
 		sourceConnection,
@@ -1279,6 +1293,115 @@ GetQueryResultStringList(MultiConnection *connection, char *query)
 	PQclear(result);
 	ForgetResults(connection);
 	return resultList;
+}
+
+
+/*
+ * PrepareReplicaIdentitiesForPublication makes sure that every source shard in
+ * publicationInfoHash can publish all of its modifications (INSERT/UPDATE/DELETE)
+ * over logical replication.
+ *
+ * A table that has neither a REPLICA IDENTITY nor a PRIMARY KEY cannot publish
+ * UPDATE/DELETE: the publisher errors out with "cannot update table ... because
+ * it does not have a replica identity and publishes updates", which would break
+ * the user's concurrent writes for the duration of the transfer. To avoid this,
+ * we temporarily set REPLICA IDENTITY FULL on such source shards right before we
+ * create the publications. With REPLICA IDENTITY FULL the publisher logs the full
+ * old tuple, so UPDATE/DELETE become publishable, and the subscriber (target) can
+ * locate rows using any usable index (or a sequential scan as a fallback) without
+ * needing its own replica identity (PG16+).
+ *
+ * The original replica identity is restored via the resource cleanup framework: we
+ * register a CLEANUP_OBJECT_REPLICA_IDENTITY record (CLEANUP_ALWAYS) that resets the
+ * shard's replica identity once the transfer completes (on success or failure). We
+ * encode the original replica identity setting into the cleanup record's object name
+ * ("<replident_char>:<qualified_shard_name>") so that it is restored faithfully.
+ *
+ * Note that setting REPLICA IDENTITY FULL requires a (brief) AccessExclusiveLock on
+ * the source shard. For tables that already have a replica identity this step is a
+ * no-op, so their transfers stay fully non-blocking; only replica-identity-less tables
+ * pay this cost, and we bound it with a short lock_timeout (see below) so that a busy
+ * shard fails the transfer fast instead of blocking indefinitely.
+ */
+void
+PrepareReplicaIdentitiesForPublication(MultiConnection *connection,
+									   HTAB *publicationInfoHash)
+{
+	if (!SetReplicaIdentityFullForLogicalReplication)
+	{
+		/*
+		 * The user has not opted in to letting Citus change a shard's replica
+		 * identity, so we leave every shard untouched. A table that lacks a
+		 * replica identity is then handled exactly as before this setting
+		 * existed: in "auto" mode VerifyTablesHaveReplicaIdentity errors out
+		 * before we get here, and with force_logical the transfer proceeds but
+		 * the publisher rejects the user's concurrent UPDATE/DELETE.
+		 */
+		return;
+	}
+
+	WorkerNode *worker = FindWorkerNode(connection->hostname, connection->port);
+
+	HASH_SEQ_STATUS status;
+	hash_seq_init(&status, publicationInfoHash);
+
+	PublicationInfo *entry = NULL;
+	while ((entry = (PublicationInfo *) hash_seq_search(&status)) != NULL)
+	{
+		ShardInterval *shard = NULL;
+		foreach_declared_ptr(shard, entry->shardIntervals)
+		{
+			/*
+			 * If the table already has a replica identity (or is a partitioned
+			 * parent, which holds no data), it can publish all modifications and
+			 * we don't need to touch it.
+			 */
+			if (RelationCanPublishAllModifications(shard->relationId))
+			{
+				continue;
+			}
+
+			Relation relation = RelationIdGetRelation(shard->relationId);
+			char originalReplicaIdentity = relation->rd_rel->relreplident;
+			RelationClose(relation);
+
+			char *shardName = ConstructQualifiedShardName(shard);
+
+			/*
+			 * Register the cleanup record before making the change so that the
+			 * original replica identity is restored even if we crash right after
+			 * the ALTER TABLE below. The object name encodes the original setting.
+			 */
+			char *cleanupObjectName = psprintf("%c:%s", originalReplicaIdentity,
+											   shardName);
+			InsertCleanupRecordOutsideTransaction(CLEANUP_OBJECT_REPLICA_IDENTITY,
+												  cleanupObjectName,
+												  worker->groupId,
+												  CLEANUP_ALWAYS);
+
+			/*
+			 * Setting REPLICA IDENTITY FULL requires an AccessExclusiveLock on the
+			 * shard, which conflicts with any concurrent access to it. To avoid
+			 * blocking indefinitely (and blocking others queued behind us for the
+			 * lock) we set a short lock_timeout so that we fail fast if the shard is
+			 * busy. The whole transfer then errors out and can be retried; the
+			 * resource cleanup framework restores the original replica identity via
+			 * the record we registered above.
+			 *
+			 * DDL propagation is disabled because the ALTER targets a shard, which is
+			 * not a distributed object. Both settings use SET LOCAL and are therefore
+			 * scoped to the transaction opened by
+			 * SendCommandListToWorkerOutsideTransactionWithConnection, so they are
+			 * reset automatically once it commits.
+			 */
+			SendCommandListToWorkerOutsideTransactionWithConnection(
+				connection,
+				list_make3(
+					"SET LOCAL lock_timeout TO '1s'",
+					"SET LOCAL citus.enable_ddl_propagation TO OFF",
+					psprintf("ALTER TABLE %s REPLICA IDENTITY FULL", shardName)));
+		}
+	}
 }
 
 

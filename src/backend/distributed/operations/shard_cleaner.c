@@ -16,6 +16,7 @@
 #include "access/genam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "commands/dbcommands.h"
 #include "commands/sequence.h"
 #include "nodes/makefuncs.h"
@@ -94,6 +95,8 @@ static bool TryDropReplicationSlotOutsideTransaction(char *replicationSlotName,
 static bool TryDropUserOutsideTransaction(char *username, char *nodeName, int nodePort);
 static bool TryDropDatabaseOutsideTransaction(char *databaseName, char *nodeName,
 											  int nodePort);
+static bool TryResetReplicaIdentityOutsideTransaction(char *objectName, char *nodeName,
+													  int nodePort);
 
 static CleanupRecord * GetCleanupRecordByNameAndType(char *objectName,
 													 CleanupObject type);
@@ -609,6 +612,12 @@ TryDropResourceByCleanupRecordOutsideTransaction(CleanupRecord *record,
 													 nodePort);
 		}
 
+		case CLEANUP_OBJECT_REPLICA_IDENTITY:
+		{
+			return TryResetReplicaIdentityOutsideTransaction(record->objectName,
+															 nodeName, nodePort);
+		}
+
 		default:
 		{
 			ereport(WARNING, (errmsg(
@@ -953,9 +962,63 @@ TryDropDatabaseOutsideTransaction(char *databaseName, char *nodeName, int nodePo
 
 
 /*
- * ErrorIfCleanupRecordForShardExists errors out if a cleanup record for the given
- * shard name exists.
+ * TryResetReplicaIdentityOutsideTransaction restores the replica identity of a shard
+ * that was temporarily set to REPLICA IDENTITY FULL for the duration of a logical
+ * replication based transfer (see PrepareReplicaIdentitiesForPublication).
+ *
+ * The objectName encodes the original replica identity setting and the qualified
+ * shard name as "<replident_char>:<qualified_shard_name>", where <replident_char> is
+ * the relreplident value captured before the change ('d' for DEFAULT, 'n' for NOTHING,
+ * etc.). We only ever set FULL on tables that could not publish all modifications, so
+ * the original is DEFAULT or NOTHING; anything else is restored to DEFAULT as a safe
+ * fallback. We use ALTER TABLE IF EXISTS so that this is a no-op if the shard has
+ * already been dropped (e.g. the source shard of a completed move).
  */
+static bool
+TryResetReplicaIdentityOutsideTransaction(char *objectName, char *nodeName, int nodePort)
+{
+	char originalReplicaIdentity = objectName[0];
+	char *qualifiedShardName = objectName + 2;
+
+	char *replicaIdentityClause = NULL;
+	switch (originalReplicaIdentity)
+	{
+		case REPLICA_IDENTITY_NOTHING:
+		{
+			replicaIdentityClause = "NOTHING";
+			break;
+		}
+
+		case REPLICA_IDENTITY_DEFAULT:
+		default:
+		{
+			replicaIdentityClause = "DEFAULT";
+			break;
+		}
+	}
+
+	int connectionFlags = OUTSIDE_TRANSACTION;
+	MultiConnection *connection = GetNodeUserDatabaseConnection(connectionFlags,
+																nodeName, nodePort,
+																CitusExtensionOwnerName(),
+																NULL);
+
+	/*
+	 * The ALTER TABLE command targets a shard, which is not a distributed object,
+	 * so we temporarily disable DDL propagation.
+	 */
+	bool success = SendOptionalCommandListToWorkerOutsideTransactionWithConnection(
+		connection,
+		list_make3(
+			"SET LOCAL lock_timeout TO '1s'",
+			"SET LOCAL citus.enable_ddl_propagation TO OFF;",
+			psprintf("ALTER TABLE IF EXISTS %s REPLICA IDENTITY %s;",
+					 qualifiedShardName, replicaIdentityClause)));
+
+	return success;
+}
+
+
 void
 ErrorIfCleanupRecordForShardExists(char *shardName)
 {
