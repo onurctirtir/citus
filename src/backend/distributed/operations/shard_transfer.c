@@ -18,8 +18,10 @@
 #include "miscadmin.h"
 
 #include "access/htup_details.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_enum.h"
+#include "catalog/pg_index.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
 #include "storage/lmgr.h"
@@ -1482,6 +1484,11 @@ ErrorIfMoveUnsupportedTableType(Oid relationId)
  * (see PrepareReplicaIdentitiesForPublication). Therefore, in the automatic mode
  * we admit a replica-identity-less table only when that setting is on; otherwise
  * we refuse it and direct the user to force_logical or block_writes.
+ *
+ * Note that the index-related settings (create_existing_indexes_early... and
+ * create_temporary_indexes...) only affect how fast the subscriber can locate
+ * rows during catch-up; they do not make a replica-identity-less table
+ * publishable, so they never affect this admission decision.
  */
 void
 VerifyTablesHaveReplicaIdentity(List *colocatedTableList)
@@ -1555,6 +1562,86 @@ RelationCanPublishAllModifications(Oid relationId)
 	RelationClose(relation);
 
 	return canPublish;
+}
+
+
+/*
+ * RelationHasUsableReplicaIdentityFullIndex returns true if the given relation has at
+ * least one index that a logical replication subscriber can use to locate rows when
+ * the publisher uses REPLICA IDENTITY FULL.
+ *
+ * This mirrors, conservatively, PostgreSQL's own subscriber-side check
+ * (IsIndexUsableForReplicaIdentityFull): the index must be a valid, non-partial btree
+ * whose leftmost key is a plain column (not an expression). Since Citus supports
+ * PostgreSQL 16 and above, a btree index that satisfies these conditions is always
+ * usable by the subscriber. Being conservative here is safe: if we fail to recognize an
+ * otherwise-usable index the only consequence is that the automatic transfer mode errors
+ * out and the user can fall back to force_logical.
+ */
+bool
+RelationHasUsableReplicaIdentityFullIndex(Oid relationId)
+{
+	Relation relation = RelationIdGetRelation(relationId);
+
+	if (relation == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("could not open relation with OID %u", relationId)));
+	}
+
+	List *indexOidList = RelationGetIndexList(relation);
+	bool hasUsableIndex = false;
+
+	Oid indexOid = InvalidOid;
+	foreach_declared_oid(indexOid, indexOidList)
+	{
+		HeapTuple indexTuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexOid));
+		if (!HeapTupleIsValid(indexTuple))
+		{
+			continue;
+		}
+
+		Form_pg_index indexForm = (Form_pg_index) GETSTRUCT(indexTuple);
+
+		bool isValidIndex = indexForm->indisvalid && indexForm->indislive;
+
+		/* a partial index (with a WHERE clause) cannot be used */
+		bool isPartial = !heap_attisnull(indexTuple, Anum_pg_index_indpred, NULL);
+
+		/* the leftmost index field must be a plain column, not an expression */
+		bool leftmostFieldIsColumn =
+			AttributeNumberIsValid(indexForm->indkey.values[0]);
+
+		/*
+		 * Determine the index access method. We read relam from the pg_class
+		 * syscache rather than using get_rel_relam(), which only exists on
+		 * PostgreSQL 17 and above.
+		 */
+		Oid indexAmOid = InvalidOid;
+		HeapTuple classTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(indexOid));
+		if (HeapTupleIsValid(classTuple))
+		{
+			indexAmOid = ((Form_pg_class) GETSTRUCT(classTuple))->relam;
+			ReleaseSysCache(classTuple);
+		}
+
+		if (isValidIndex && !isPartial && leftmostFieldIsColumn &&
+			indexAmOid == BTREE_AM_OID)
+		{
+			hasUsableIndex = true;
+		}
+
+		ReleaseSysCache(indexTuple);
+
+		if (hasUsableIndex)
+		{
+			break;
+		}
+	}
+
+	RelationClose(relation);
+
+	return hasUsableIndex;
 }
 
 

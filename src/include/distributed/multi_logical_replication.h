@@ -27,6 +27,14 @@ extern int LogicalReplicationTimeout;
 extern bool PlacementMovedUsingLogicalReplicationInTX;
 
 /*
+ * When enabled, Citus builds a temporary index on the destination shard of a
+ * logical-replication based transfer for tables that have neither a replica
+ * identity nor a usable index, so the subscriber can locate rows with an index
+ * scan instead of a sequential scan. Defaults to off.
+ */
+extern bool CreateTemporaryIndexesForLogicalReplication;
+
+/*
  * When enabled, Citus sets REPLICA IDENTITY FULL on the source shard of any table
  * that has neither a replica identity nor a primary key before publishing it for
  * a logical-replication based transfer, so the table's UPDATE/DELETE become

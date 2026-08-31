@@ -97,6 +97,8 @@ static bool TryDropDatabaseOutsideTransaction(char *databaseName, char *nodeName
 											  int nodePort);
 static bool TryResetReplicaIdentityOutsideTransaction(char *objectName, char *nodeName,
 													  int nodePort);
+static bool TryDropIndexOutsideTransaction(char *qualifiedIndexName, char *nodeName,
+										   int nodePort);
 
 static CleanupRecord * GetCleanupRecordByNameAndType(char *objectName,
 													 CleanupObject type);
@@ -618,6 +620,12 @@ TryDropResourceByCleanupRecordOutsideTransaction(CleanupRecord *record,
 															 nodeName, nodePort);
 		}
 
+		case CLEANUP_OBJECT_INDEX:
+		{
+			return TryDropIndexOutsideTransaction(record->objectName,
+												  nodeName, nodePort);
+		}
+
 		default:
 		{
 			ereport(WARNING, (errmsg(
@@ -1014,6 +1022,39 @@ TryResetReplicaIdentityOutsideTransaction(char *objectName, char *nodeName, int 
 			"SET LOCAL citus.enable_ddl_propagation TO OFF;",
 			psprintf("ALTER TABLE IF EXISTS %s REPLICA IDENTITY %s;",
 					 qualifiedShardName, replicaIdentityClause)));
+
+	return success;
+}
+
+
+/*
+ * TryDropIndexOutsideTransaction drops a temporary "helper" index that was built on
+ * the destination shard of a logical-replication based transfer (see
+ * CreateTemporaryReplicaIdentityFullIndexes). The objectName is the schema-qualified
+ * index name. We use DROP INDEX IF EXISTS so that this is a no-op if the index (or
+ * its shard) has already been dropped, e.g. when the destination shard placement was
+ * removed by an earlier cleanup record on a failed transfer.
+ */
+static bool
+TryDropIndexOutsideTransaction(char *qualifiedIndexName, char *nodeName, int nodePort)
+{
+	int connectionFlags = OUTSIDE_TRANSACTION;
+	MultiConnection *connection = GetNodeUserDatabaseConnection(connectionFlags,
+																nodeName, nodePort,
+																CitusExtensionOwnerName(),
+																NULL);
+
+	/*
+	 * The DROP INDEX command targets a shard index, which is not a distributed
+	 * object, so we temporarily disable DDL propagation. A short lock_timeout keeps
+	 * us from blocking indefinitely on a busy destination shard.
+	 */
+	bool success = SendOptionalCommandListToWorkerOutsideTransactionWithConnection(
+		connection,
+		list_make3(
+			"SET LOCAL lock_timeout TO '1s'",
+			"SET LOCAL citus.enable_ddl_propagation TO OFF;",
+			psprintf("DROP INDEX IF EXISTS %s;", qualifiedIndexName)));
 
 	return success;
 }
