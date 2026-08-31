@@ -27,6 +27,15 @@ extern int LogicalReplicationTimeout;
 extern bool PlacementMovedUsingLogicalReplicationInTX;
 
 /*
+ * When enabled, Citus sets REPLICA IDENTITY FULL on the source shard of any table
+ * that has neither a replica identity nor a primary key before publishing it for
+ * a logical-replication based transfer, so the table's UPDATE/DELETE become
+ * publishable. The original replica identity is restored afterwards. Defaults to
+ * off, in which case Citus never changes a shard's replica identity.
+ */
+extern bool SetReplicaIdentityFullForLogicalReplication;
+
+/*
  * NodeAndOwner should be used as a key for structs that should be hashed by a
  * combination of node and owner.
  */
@@ -144,6 +153,8 @@ extern XLogRecPtr GetRemoteLogPosition(MultiConnection *connection);
 extern List * GetQueryResultStringList(MultiConnection *connection, char *query);
 
 extern MultiConnection * GetReplicationConnection(char *nodeName, int nodePort);
+extern void PrepareReplicaIdentitiesForPublication(MultiConnection *sourceConnection,
+												   HTAB *publicationInfoHash);
 extern void CreatePublications(MultiConnection *sourceConnection,
 							   HTAB *publicationInfoHash);
 extern void CreateSubscriptions(MultiConnection *sourceConnection,

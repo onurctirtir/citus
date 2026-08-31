@@ -1468,6 +1468,7 @@ NonBlockingShardSplit(SplitOperation splitOperation,
 					  operationName)));
 
 	/* 4) Create Publications. */
+	PrepareReplicaIdentitiesForPublication(sourceConnection, publicationInfoHash);
 	CreatePublications(sourceConnection, publicationInfoHash);
 
 	/* 5) Execute 'worker_split_shard_replication_setup UDF */
