@@ -398,30 +398,7 @@ GetDependencyCreateDDLCommands(const ObjectAddress *dependency)
 
 				if (IsCitusTable(relationId))
 				{
-					bool creatingShellTableOnRemoteNode = true;
-					List *tableDDLCommands = GetFullTableCreationCommands(relationId,
-																		  WORKER_NEXTVAL_SEQUENCE_DEFAULTS,
-																		  INCLUDE_IDENTITY,
-																		  creatingShellTableOnRemoteNode);
-					TableDDLCommand *tableDDLCommand = NULL;
-					foreach_ptr(tableDDLCommand, tableDDLCommands)
-					{
-						Assert(CitusIsA(tableDDLCommand, TableDDLCommand));
-						commandList = lappend(commandList, GetTableDDLCommand(
-												  tableDDLCommand));
-					}
-
-					/*
-					 * We need to drop table, if exists, first to make table creation
-					 * idempotent. Before dropping the table, we should also break
-					 * dependencies with sequences since `drop cascade table` would also
-					 * drop depended sequences. This is safe as we still record dependency
-					 * with the sequence during table creation.
-					 */
-					commandList = lcons(DropTableIfExistsCommand(relationId),
-										commandList);
-					commandList = lcons(WorkerDropSequenceDependencyCommand(relationId),
-										commandList);
+					commandList = ShellTableCreationCommandList(relationId);
 				}
 
 				return commandList;
@@ -553,6 +530,56 @@ GetDependencyCreateDDLCommands(const ObjectAddress *dependency)
 					errdetail(
 						"citus tries to recreate an unsupported object on its workers"),
 					errhint("please report a bug as this should not be happening")));
+}
+
+
+/*
+ * ShellTableCreationCommandList returns the ordered list of DDL command strings
+ * that (re)create the shell table for the given Citus table on a worker node.
+ *
+ * The returned commands are self-contained and idempotent so they can be
+ * replayed as-is on a worker (either accumulated into the serial batch path or
+ * dispatched as a parallel task):
+ *   1. break the shell table's sequence dependency
+ *      (WorkerDropSequenceDependencyCommand) so that the following DROP does not
+ *      cascade into the depended sequences,
+ *   2. DROP TABLE IF EXISTS the shell table (idempotency),
+ *   3. the full shell table creation commands
+ *      (GetFullTableCreationCommands with creatingShellTableOnRemoteNode=true),
+ *      which re-record the sequence dependency during creation.
+ *
+ * This is the single source of truth for the shell table bundle: both
+ * GetDependencyCreateDDLCommands() (serial dependency path) and the parallel
+ * shell table creation path in metadata_sync.c call it.
+ */
+List *
+ShellTableCreationCommandList(Oid relationId)
+{
+	List *commandList = NIL;
+
+	bool creatingShellTableOnRemoteNode = true;
+	List *tableDDLCommands = GetFullTableCreationCommands(relationId,
+														  WORKER_NEXTVAL_SEQUENCE_DEFAULTS,
+														  INCLUDE_IDENTITY,
+														  creatingShellTableOnRemoteNode);
+	TableDDLCommand *tableDDLCommand = NULL;
+	foreach_ptr(tableDDLCommand, tableDDLCommands)
+	{
+		Assert(CitusIsA(tableDDLCommand, TableDDLCommand));
+		commandList = lappend(commandList, GetTableDDLCommand(tableDDLCommand));
+	}
+
+	/*
+	 * We need to drop table, if exists, first to make table creation
+	 * idempotent. Before dropping the table, we should also break
+	 * dependencies with sequences since `drop cascade table` would also
+	 * drop depended sequences. This is safe as we still record dependency
+	 * with the sequence during table creation.
+	 */
+	commandList = lcons(DropTableIfExistsCommand(relationId), commandList);
+	commandList = lcons(WorkerDropSequenceDependencyCommand(relationId), commandList);
+
+	return commandList;
 }
 
 

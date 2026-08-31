@@ -31,6 +31,10 @@ extern int MetadataSyncInterval;
 extern int MetadataSyncRetryInterval;
 extern int MetadataSyncTransMode;
 extern int MetadataSyncCacheFlushInterval;
+extern int MetadataSyncPoolTaskSize;
+extern bool MetadataSyncUsePool;
+extern bool MetadataSyncReleaseDeparseLocks;
+extern bool MetadataSyncPoolSkipExecute;
 
 /*
  * MetadataSyncContext is used throughout metadata sync.
@@ -44,6 +48,22 @@ typedef struct MetadataSyncContext
 	bool collectCommands; /* if we collect commands instead of sending and resetting */
 	List *collectedCommands; /* collected commands. (NIL if collectCommands == false) */
 	bool nodesAddedInSameTransaction; /* if the nodes are added just before activation */
+
+	/*
+	 * Object addresses (views, materialized views, publications) that depend on
+	 * Citus shell tables and therefore must be (re)created AFTER the shell table
+	 * phase. Populated by SendDependencyCreationCommands() only when the shell
+	 * table pool path is enabled -- in that path shell tables are deferred out of
+	 * the dependency order and created later in parallel, so any object whose DDL
+	 * references a shell table (e.g. CREATE VIEW ... FROM t, CREATE PUBLICATION
+	 * ... FOR TABLE t) would fail if emitted in the normal dependency phase.
+	 * These are drained by SendDeferredDependentCreationCommands() after the
+	 * shell tables exist. Collected in dependency order so relative ordering
+	 * among the deferred objects (e.g. a view over a view) is preserved.
+	 * Allocated in TopTransactionContext so they survive the per-step resets of
+	 * context->context; freed when the local sync transaction ends.
+	 */
+	List *deferredDependentObjectAddresses;
 } MetadataSyncContext;
 
 typedef enum
@@ -173,6 +193,7 @@ extern void ActivateNodeList(MetadataSyncContext *context);
 
 extern char * WorkerDropAllShellTablesCommand(bool singleTransaction);
 extern char * WorkerDropSequenceDependencyCommand(Oid relationId);
+extern List * ShellTableCreationCommandList(Oid relationId);
 
 extern void SyncDistributedObjects(MetadataSyncContext *context);
 extern void SendNodeWideObjectsSyncCommands(MetadataSyncContext *context);
@@ -181,8 +202,12 @@ extern void SendMetadataDeletionCommands(MetadataSyncContext *context);
 extern void SendColocationMetadataCommands(MetadataSyncContext *context);
 extern void SendTenantSchemaMetadataCommands(MetadataSyncContext *context);
 extern void SendDependencyCreationCommands(MetadataSyncContext *context);
+extern void SendShellTableCreationCommandsViaPool(MetadataSyncContext *context);
+extern void SendSequenceCreationCommandsViaPool(MetadataSyncContext *context);
 extern void SendDistTableMetadataCommands(MetadataSyncContext *context);
+extern void SendDistTableMetadataCommandsViaPool(MetadataSyncContext *context);
 extern void SendDistObjectCommands(MetadataSyncContext *context);
+extern void SendDistObjectCommandsViaPool(MetadataSyncContext *context);
 extern void SendInterTableRelationshipCommands(MetadataSyncContext *context);
 
 #define DELETE_ALL_NODES "DELETE FROM pg_dist_node"
