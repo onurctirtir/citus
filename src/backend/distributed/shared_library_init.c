@@ -1190,25 +1190,6 @@ RegisterCitusConfigVariables(void)
 		GUC_STANDARD,
 		NULL, NULL, NULL);
 
-	DefineCustomBoolVariable(
-		"citus.create_existing_indexes_early_for_logical_replication",
-		gettext_noop("Builds a table's existing subscriber-usable index on the "
-					 "destination shard early during a logical-replication based "
-					 "shard transfer."),
-		gettext_noop("When enabled, if a table lacks an early-built replica "
-					 "identity index (no primary key and no REPLICA IDENTITY USING "
-					 "INDEX) but has an existing index the subscriber can use under "
-					 "REPLICA IDENTITY FULL, Citus builds that index on the "
-					 "destination shard right after the initial data copy instead of "
-					 "in the late post-load phase. This lets the subscriber use an "
-					 "index scan during the bulk catch-up. The index is a regular "
-					 "index that the destination shard keeps."),
-		&CreateExistingIndexesEarlyForLogicalReplication,
-		false,
-		PGC_USERSET,
-		GUC_STANDARD,
-		NULL, NULL, NULL);
-
 	DefineCustomEnumVariable(
 		"citus.create_object_propagation",
 		gettext_noop("Controls the behavior of CREATE statements in transactions for "
@@ -1223,27 +1204,6 @@ RegisterCitusConfigVariables(void)
 					 "of new objects."),
 		&CreateObjectPropagationMode,
 		CREATE_OBJECT_PROPAGATION_IMMEDIATE, create_object_propagation_options,
-		PGC_USERSET,
-		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		"citus.create_temporary_indexes_for_logical_replication",
-		gettext_noop("Builds a temporary index on the destination shard during a "
-					 "logical replication based shard transfer for tables that lack "
-					 "both a replica identity and a usable index."),
-		gettext_noop("When Citus transfers a shard of a table that has neither a "
-					 "replica identity nor an index usable under REPLICA IDENTITY "
-					 "FULL, the logical replication subscriber has to locate rows "
-					 "with a sequential scan, which can be slow. With this setting "
-					 "enabled Citus builds a temporary btree index (on a column "
-					 "chosen from the source shard's statistics) on the destination "
-					 "shard so that the subscriber can use an index scan instead. "
-					 "The index is dropped once the transfer completes. This also "
-					 "allows such tables to be transferred using the automatic "
-					 "shard_transfer_mode."),
-		&CreateTemporaryIndexesForLogicalReplication,
-		false,
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
@@ -2597,26 +2557,6 @@ RegisterCitusConfigVariables(void)
 		true,
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		"citus.set_replica_identity_full_for_logical_replication",
-		gettext_noop("Temporarily sets REPLICA IDENTITY FULL on the source shard of "
-					 "a table that has no replica identity during a "
-					 "logical-replication based shard transfer."),
-		gettext_noop("A table that has neither a replica identity nor a primary key "
-					 "cannot publish its UPDATE/DELETE commands, so the publisher "
-					 "rejects such writes while the table is being transferred with "
-					 "logical replication. When enabled, Citus sets REPLICA IDENTITY "
-					 "FULL on the source shard of such a table before publishing it, "
-					 "making its writes publishable, and restores the original "
-					 "replica identity once the transfer completes (or via the "
-					 "cleanup daemon on failure). When disabled, Citus never changes "
-					 "a shard's replica identity."),
-		&SetReplicaIdentityFullForLogicalReplication,
-		false,
-		PGC_USERSET,
-		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(

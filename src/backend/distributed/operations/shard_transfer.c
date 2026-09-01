@@ -109,12 +109,14 @@ static void ErrorIfSameNode(char *sourceNodeName, int sourceNodePort,
 static void CopyShardTables(List *shardIntervalList, char *sourceNodeName,
 							int32 sourceNodePort, char *targetNodeName,
 							int32 targetNodePort, bool useLogicalReplication,
+							bool useAdvancedLogicalReplication,
 							const char *operationName, uint32 optionFlags);
 static void CopyShardTablesViaLogicalReplication(List *shardIntervalList,
 												 char *sourceNodeName,
 												 int32 sourceNodePort,
 												 char *targetNodeName,
 												 int32 targetNodePort,
+												 bool useAdvancedLogicalReplication,
 												 uint32 optionFlags);
 
 static void CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
@@ -599,6 +601,7 @@ TransferShards(int64 shardId, char *sourceNodeName,
 						,
 						targetNodePort, (shardReplicationMode ==
 										 TRANSFER_MODE_FORCE_LOGICAL),
+						false,
 						operationFunctionName, optionFlags);
 
 		/* We don't need to do anything else, just return */
@@ -644,6 +647,15 @@ TransferShards(int64 shardId, char *sourceNodeName,
 	 */
 	bool useLogicalReplication = CanUseLogicalReplication(distributedTableId,
 														  shardReplicationMode);
+
+	/*
+	 * The force_advanced_logical mode enables the extra logical-replication
+	 * capabilities for tables that lack a usable replica identity (setting REPLICA
+	 * IDENTITY FULL on the source shard, and building catch-up indexes on the
+	 * destination shard). Everything else behaves like force_logical.
+	 */
+	bool useAdvancedLogicalReplication =
+		(shardReplicationMode == TRANSFER_MODE_FORCE_ADVANCED_LOGICAL);
 	if (!useLogicalReplication)
 	{
 		BlockWritesToShardList(colocatedShardList);
@@ -701,8 +713,8 @@ TransferShards(int64 shardId, char *sourceNodeName,
 	}
 
 	CopyShardTables(colocatedShardList, sourceNodeName, sourceNodePort, targetNodeName,
-					targetNodePort, useLogicalReplication, operationFunctionName,
-					optionFlags);
+					targetNodePort, useLogicalReplication, useAdvancedLogicalReplication,
+					operationFunctionName, optionFlags);
 
 	if (transferType == SHARD_TRANSFER_MOVE)
 	{
@@ -1478,17 +1490,9 @@ ErrorIfMoveUnsupportedTableType(Oid relationId)
  * Logical replication needs to be able to publish UPDATE and DELETE commands. A
  * table that has a REPLICA IDENTITY or PRIMARY KEY satisfies this directly. A
  * table that has neither cannot publish its UPDATE/DELETE, so the publisher would
- * reject the user's concurrent writes during the transfer -- unless Citus is
- * allowed to temporarily set REPLICA IDENTITY FULL on the source shard, which is
- * exactly what citus.set_replica_identity_full_for_logical_replication enables
- * (see PrepareReplicaIdentitiesForPublication). Therefore, in the automatic mode
- * we admit a replica-identity-less table only when that setting is on; otherwise
- * we refuse it and direct the user to force_logical or block_writes.
- *
- * Note that the index-related settings (create_existing_indexes_early... and
- * create_temporary_indexes...) only affect how fast the subscriber can locate
- * rows during catch-up; they do not make a replica-identity-less table
- * publishable, so they never affect this admission decision.
+ * reject the user's concurrent writes during the transfer. Therefore, in the
+ * automatic mode we refuse such a table and direct the user to
+ * force_advanced_logical, force_logical, or block_writes.
  */
 void
 VerifyTablesHaveReplicaIdentity(List *colocatedTableList)
@@ -1504,16 +1508,6 @@ VerifyTablesHaveReplicaIdentity(List *colocatedTableList)
 			continue;
 		}
 
-		/*
-		 * The table has no replica identity. It can only be transferred with
-		 * logical replication if Citus is allowed to set REPLICA IDENTITY FULL on
-		 * its source shard, which makes its UPDATE/DELETE publishable.
-		 */
-		if (SetReplicaIdentityFullForLogicalReplication)
-		{
-			continue;
-		}
-
 		char *colocatedRelationName = get_rel_name(colocatedTableId);
 
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1525,7 +1519,8 @@ VerifyTablesHaveReplicaIdentity(List *colocatedTableList)
 								  "there is a REPLICA IDENTITY or PRIMARY KEY."),
 						errhint("If you wish to continue without a replica "
 								"identity set the shard_transfer_mode to "
-								"'force_logical' or 'block_writes'.")));
+								"'force_advanced_logical', 'force_logical' or "
+								"'block_writes'.")));
 	}
 }
 
@@ -1803,6 +1798,10 @@ LookupShardTransferMode(Oid shardReplicationModeOid)
 	{
 		shardReplicationMode = TRANSFER_MODE_FORCE_LOGICAL;
 	}
+	else if (strncmp(enumLabel, "force_advanced_logical", NAMEDATALEN) == 0)
+	{
+		shardReplicationMode = TRANSFER_MODE_FORCE_ADVANCED_LOGICAL;
+	}
 	else if (strncmp(enumLabel, "block_writes", NAMEDATALEN) == 0)
 	{
 		shardReplicationMode = TRANSFER_MODE_BLOCK_WRITES;
@@ -1862,6 +1861,7 @@ ErrorIfReplicatingDistributedTableWithFKeys(List *tableIdList)
 static void
 CopyShardTables(List *shardIntervalList, char *sourceNodeName, int32 sourceNodePort,
 				char *targetNodeName, int32 targetNodePort, bool useLogicalReplication,
+				bool useAdvancedLogicalReplication,
 				const char *operationName, uint32 optionFlags)
 {
 	if (list_length(shardIntervalList) < 1)
@@ -1882,7 +1882,8 @@ CopyShardTables(List *shardIntervalList, char *sourceNodeName, int32 sourceNodeP
 	{
 		CopyShardTablesViaLogicalReplication(shardIntervalList, sourceNodeName,
 											 sourceNodePort, targetNodeName,
-											 targetNodePort, optionFlags);
+											 targetNodePort,
+											 useAdvancedLogicalReplication, optionFlags);
 	}
 	else
 	{
@@ -1904,7 +1905,9 @@ CopyShardTables(List *shardIntervalList, char *sourceNodeName, int32 sourceNodeP
 static void
 CopyShardTablesViaLogicalReplication(List *shardIntervalList, char *sourceNodeName,
 									 int32 sourceNodePort, char *targetNodeName,
-									 int32 targetNodePort, uint32 optionFlags)
+									 int32 targetNodePort,
+									 bool useAdvancedLogicalReplication,
+									 uint32 optionFlags)
 {
 	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
 													   "CopyShardTablesViaLogicalReplication",
@@ -1948,7 +1951,7 @@ CopyShardTablesViaLogicalReplication(List *shardIntervalList, char *sourceNodeNa
 	/* data copy is done seperately when logical replication is used */
 	LogicallyReplicateShards(shardIntervalList, sourceNodeName,
 							 sourceNodePort, targetNodeName, targetNodePort,
-							 skipRelationshipCreation);
+							 skipRelationshipCreation, useAdvancedLogicalReplication);
 }
 
 

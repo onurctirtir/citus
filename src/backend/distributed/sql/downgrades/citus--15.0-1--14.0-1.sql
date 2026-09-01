@@ -26,3 +26,9 @@ DROP FUNCTION IF EXISTS citus_internal.acquire_placement_colocation_lock(bigint,
 DROP FUNCTION IF EXISTS pg_catalog.citus_cluster_changes_block(int);
 DROP FUNCTION IF EXISTS pg_catalog.citus_cluster_changes_unblock();
 DROP FUNCTION IF EXISTS pg_catalog.citus_cluster_changes_block_status();
+
+-- The 'force_advanced_logical' value added to citus.shard_transfer_mode cannot be
+-- removed on downgrade, because PostgreSQL does not support removing a value from an
+-- existing enum type. Leaving the value in place is harmless: the downgraded Citus
+-- code never produces it, and LookupShardTransferMode rejects it as an invalid label
+-- if a user passes it explicitly. This is a documented no-op.

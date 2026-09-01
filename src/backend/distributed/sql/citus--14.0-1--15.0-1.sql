@@ -19,3 +19,7 @@ DROP FUNCTION IF EXISTS pg_catalog.worker_apply_sequence_command(text, regtype);
 #include "udfs/citus_cluster_changes_block/15.0-1.sql"
 #include "udfs/citus_cluster_changes_unblock/15.0-1.sql"
 #include "udfs/citus_cluster_changes_block_status/15.0-1.sql"
+
+-- add the force_advanced_logical shard transfer mode, which enables the extra
+-- logical-replication capabilities for tables that lack a usable replica identity
+ALTER TYPE citus.shard_transfer_mode ADD VALUE IF NOT EXISTS 'force_advanced_logical';

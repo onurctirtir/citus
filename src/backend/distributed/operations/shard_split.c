@@ -1468,7 +1468,7 @@ NonBlockingShardSplit(SplitOperation splitOperation,
 					  operationName)));
 
 	/* 4) Create Publications. */
-	PrepareReplicaIdentitiesForPublication(sourceConnection, publicationInfoHash);
+	PrepareReplicaIdentitiesForPublication(sourceConnection, publicationInfoHash, false);
 	CreatePublications(sourceConnection, publicationInfoHash);
 
 	/* 5) Execute 'worker_split_shard_replication_setup UDF */
@@ -1557,7 +1557,8 @@ NonBlockingShardSplit(SplitOperation splitOperation,
 									 logicalRepTargetList,
 									 groupedLogicalRepTargetsHash,
 									 SHARD_SPLIT,
-									 skipInterShardRelationshipCreation);
+									 skipInterShardRelationshipCreation,
+									 false);
 
 	/*
 	 * 10) Delete old shards metadata and mark the shards as to be deferred drop.

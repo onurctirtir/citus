@@ -5,27 +5,25 @@
 -- have a replica identity (no primary key; REPLICA IDENTITY DEFAULT with no PK,
 -- or REPLICA IDENTITY NOTHING).
 --
--- The behavior is controlled by three independent, default-off GUCs. With all of
--- them off the behavior is identical to upstream Citus:
+-- The extra capabilities are all enabled together by a single opt-in shard
+-- transfer mode, 'force_advanced_logical'. With any other mode the behavior is
+-- identical to upstream Citus. When 'force_advanced_logical' is used, Citus does
+-- all three of the following for a no-replica-identity table:
 --
---  * citus.set_replica_identity_full_for_logical_replication
---      When on, Citus temporarily sets REPLICA IDENTITY FULL on the SOURCE shards
---      of a no-replica-identity table for the duration of the logical replication
---      (so the publisher does not reject the user's UPDATE/DELETE statements) and
---      restores the original replica identity afterwards. This is what makes a
---      no-replica-identity table publishable, so it is the sole switch that lets
---      "auto" mode admit such a table for a non-blocking move.
+--  * It temporarily sets REPLICA IDENTITY FULL on the SOURCE shards of the table
+--    for the duration of the logical replication (so the publisher does not reject
+--    the user's UPDATE/DELETE statements) and restores the original replica
+--    identity afterwards. This is what makes a no-replica-identity table
+--    publishable, so 'force_advanced_logical' can transfer such a table with a
+--    non-blocking move.
 --
---  * citus.create_existing_indexes_early_for_logical_replication
---      When on, one of the table's existing usable btree indexes is built early on
---      the destination shard (before catch-up) so the subscriber can use an index
---      scan, and that index is excluded from the late CREATE INDEX phase so it is
---      created exactly once. Speed only; never affects admission.
+--  * If the table has an existing usable btree index, that index is built early on
+--    the destination shard (before catch-up) so the subscriber can use an index
+--    scan, and that index is excluded from the late CREATE INDEX phase so it is
+--    created exactly once. Speed only.
 --
---  * citus.create_temporary_indexes_for_logical_replication
---      When on, a throwaway helper btree index is built on the destination shard
---      for a table that has no usable index, and dropped when the move finishes.
---      Speed only; never affects admission.
+--  * If the table has no usable index at all, a throwaway helper btree index is
+--    built on the destination shard and dropped when the move finishes. Speed only.
 --
 CREATE SCHEMA move_no_ri;
 SET search_path TO move_no_ri;
@@ -33,11 +31,12 @@ SET citus.shard_count TO 4;
 SET citus.shard_replication_factor TO 1;
 SET citus.next_shard_id TO 8980000;
 --
--- SECTION 1: all GUCs off => upstream behavior is preserved.
+-- SECTION 1: any mode other than force_advanced_logical => upstream behavior is
+--            preserved.
 --
 --
 -- 1a) no replica identity + a usable secondary btree index, "auto":
---     with the admission GUC off this still errors, exactly like upstream.
+--     "auto" still errors, exactly like upstream.
 --
 CREATE TABLE t_usable_idx (a int, b text);
 CREATE INDEX t_usable_idx_a ON t_usable_idx (a);
@@ -52,11 +51,11 @@ SELECT min(shardid) AS shardid_usable FROM pg_dist_shard WHERE logicalrelid='t_u
 SELECT nodeport AS src_usable,
        CASE WHEN nodeport = :worker_1_port THEN :worker_2_port ELSE :worker_1_port END AS tgt_usable
 FROM pg_dist_shard_placement WHERE shardid = :shardid_usable \gset
--- errors (admission GUC off)
+-- errors ("auto" rejects a no-replica-identity table)
 SELECT citus_move_shard_placement(:shardid_usable, 'localhost', :src_usable, 'localhost', :tgt_usable, shard_transfer_mode:='auto');
 ERROR:  cannot use logical replication to transfer shards of the relation t_usable_idx since it doesn't have a REPLICA IDENTITY or PRIMARY KEY
 DETAIL:  UPDATE and DELETE commands on the shard will error out during logical replication unless there is a REPLICA IDENTITY or PRIMARY KEY.
-HINT:  If you wish to continue without a replica identity set the shard_transfer_mode to 'force_logical' or 'block_writes'.
+HINT:  If you wish to continue without a replica identity set the shard_transfer_mode to 'force_advanced_logical', 'force_logical' or 'block_writes'.
 --
 -- 1b) no replica identity + NO index at all, "auto": errors, exactly like upstream.
 --
@@ -72,16 +71,17 @@ SELECT min(shardid) AS shardid_no_idx FROM pg_dist_shard WHERE logicalrelid='t_n
 SELECT nodeport AS src_no_idx,
        CASE WHEN nodeport = :worker_1_port THEN :worker_2_port ELSE :worker_1_port END AS tgt_no_idx
 FROM pg_dist_shard_placement WHERE shardid = :shardid_no_idx \gset
--- errors (admission GUC off)
+-- errors ("auto" rejects a no-replica-identity table)
 SELECT citus_move_shard_placement(:shardid_no_idx, 'localhost', :src_no_idx, 'localhost', :tgt_no_idx, shard_transfer_mode:='auto');
 ERROR:  cannot use logical replication to transfer shards of the relation t_no_idx since it doesn't have a REPLICA IDENTITY or PRIMARY KEY
 DETAIL:  UPDATE and DELETE commands on the shard will error out during logical replication unless there is a REPLICA IDENTITY or PRIMARY KEY.
-HINT:  If you wish to continue without a replica identity set the shard_transfer_mode to 'force_logical' or 'block_writes'.
+HINT:  If you wish to continue without a replica identity set the shard_transfer_mode to 'force_advanced_logical', 'force_logical' or 'block_writes'.
 --
--- 1c) force_logical always skips the admission check. With the admission GUC off
---     Citus does NOT touch the replica identity, so this behaves exactly like
---     upstream: the move itself succeeds (there are no concurrent writes here) and
---     the source replica identity is left as the original default 'd'.
+-- 1c) force_logical always skips the admission check. Plain force_logical does NOT
+--     touch the replica identity (that is only done by force_advanced_logical), so
+--     this behaves exactly like upstream: the move itself succeeds (there are no
+--     concurrent writes here) and the source replica identity is left as the
+--     original default 'd'.
 --
 SELECT citus_move_shard_placement(:shardid_no_idx, 'localhost', :src_no_idx, 'localhost', :tgt_no_idx, shard_transfer_mode:='force_logical');
  citus_move_shard_placement
@@ -108,21 +108,20 @@ SELECT DISTINCT result FROM run_command_on_placements('t_no_idx', 'SELECT relrep
 (1 row)
 
 --
--- SECTION 2: citus.set_replica_identity_full_for_logical_replication
---            admits a no-replica-identity table for a non-blocking move and
---            faithfully restores its original replica identity afterwards.
+-- SECTION 2: force_advanced_logical transfers a no-replica-identity table with a
+--            non-blocking move and faithfully restores its original replica
+--            identity afterwards.
 --
-SET citus.set_replica_identity_full_for_logical_replication TO on;
 --
--- 2a) no replica identity + NO index, "auto": now admitted (the source is set to
---     REPLICA IDENTITY FULL for the move). Move succeeds, data is preserved, and the
+-- 2a) no replica identity + NO index, force_advanced_logical: the source is set to
+--     REPLICA IDENTITY FULL for the move. Move succeeds, data is preserved, and the
 --     original default replica identity 'd' is restored on the surviving placement.
 --
 SELECT min(shardid) AS shardid_no_idx2 FROM pg_dist_shard WHERE logicalrelid='t_no_idx'::regclass \gset
 SELECT nodeport AS src_no_idx2,
        CASE WHEN nodeport = :worker_1_port THEN :worker_2_port ELSE :worker_1_port END AS tgt_no_idx2
 FROM pg_dist_shard_placement WHERE shardid = :shardid_no_idx2 \gset
-SELECT citus_move_shard_placement(:shardid_no_idx2, 'localhost', :src_no_idx2, 'localhost', :tgt_no_idx2, shard_transfer_mode:='auto');
+SELECT citus_move_shard_placement(:shardid_no_idx2, 'localhost', :src_no_idx2, 'localhost', :tgt_no_idx2, shard_transfer_mode:='force_advanced_logical');
  citus_move_shard_placement
 ---------------------------------------------------------------------
 
@@ -147,14 +146,14 @@ SELECT DISTINCT result FROM run_command_on_placements('t_no_idx', 'SELECT relrep
 (1 row)
 
 --
--- 2b) no replica identity + a usable btree index, "auto": also admitted; the
---     original default replica identity 'd' is restored.
+-- 2b) no replica identity + a usable btree index, force_advanced_logical: also
+--     succeeds; the original default replica identity 'd' is restored.
 --
 SELECT min(shardid) AS shardid_usable2 FROM pg_dist_shard WHERE logicalrelid='t_usable_idx'::regclass \gset
 SELECT nodeport AS src_usable2,
        CASE WHEN nodeport = :worker_1_port THEN :worker_2_port ELSE :worker_1_port END AS tgt_usable2
 FROM pg_dist_shard_placement WHERE shardid = :shardid_usable2 \gset
-SELECT citus_move_shard_placement(:shardid_usable2, 'localhost', :src_usable2, 'localhost', :tgt_usable2, shard_transfer_mode:='auto');
+SELECT citus_move_shard_placement(:shardid_usable2, 'localhost', :src_usable2, 'localhost', :tgt_usable2, shard_transfer_mode:='force_advanced_logical');
  citus_move_shard_placement
 ---------------------------------------------------------------------
 
@@ -179,8 +178,9 @@ SELECT DISTINCT result FROM run_command_on_placements('t_usable_idx', 'SELECT re
 (1 row)
 
 --
--- 2c) REPLICA IDENTITY NOTHING + a usable index, "auto": admitted, and the original
---     NOTHING identity is faithfully restored ('n', not left as FULL 'f').
+-- 2c) REPLICA IDENTITY NOTHING + a usable index, force_advanced_logical: succeeds,
+--     and the original NOTHING identity is faithfully restored ('n', not left as
+--     FULL 'f').
 --
 CREATE TABLE t_nothing_idx (a int, b text);
 CREATE INDEX t_nothing_idx_a ON t_nothing_idx (a);
@@ -196,7 +196,7 @@ SELECT min(shardid) AS shardid_nothing FROM pg_dist_shard WHERE logicalrelid='t_
 SELECT nodeport AS src_nothing,
        CASE WHEN nodeport = :worker_1_port THEN :worker_2_port ELSE :worker_1_port END AS tgt_nothing
 FROM pg_dist_shard_placement WHERE shardid = :shardid_nothing \gset
-SELECT citus_move_shard_placement(:shardid_nothing, 'localhost', :src_nothing, 'localhost', :tgt_nothing, shard_transfer_mode:='auto');
+SELECT citus_move_shard_placement(:shardid_nothing, 'localhost', :src_nothing, 'localhost', :tgt_nothing, shard_transfer_mode:='force_advanced_logical');
  citus_move_shard_placement
 ---------------------------------------------------------------------
 
@@ -220,23 +220,18 @@ SELECT DISTINCT result FROM run_command_on_placements('t_nothing_idx', 'SELECT r
  n
 (1 row)
 
-RESET citus.set_replica_identity_full_for_logical_replication;
 --
--- SECTION 3: citus.create_existing_indexes_early_for_logical_replication builds one
---            existing usable index early on the destination shard and excludes it
---            from the late CREATE INDEX phase, so it is created exactly once. If the
---            exclusion were wrong the move would fail with a duplicate-index error,
---            so a successful move with preserved data is the proof it works.
+-- SECTION 3: under force_advanced_logical one existing usable index is built early
+--            on the destination shard and excluded from the late CREATE INDEX
+--            phase, so it is created exactly once. If the exclusion were wrong the
+--            move would fail with a duplicate-index error, so a successful move with
+--            preserved data is the proof it works.
 --
---            (The admission GUC is on as well, because these are no-replica-identity
---            tables moved in "auto".)
 --
-SET citus.set_replica_identity_full_for_logical_replication TO on;
-SET citus.create_existing_indexes_early_for_logical_replication TO on;
---
--- 3a) no replica identity + a usable btree index, "auto": the existing index is
---     built early on the destination shard (not a second time), the move succeeds,
---     data is preserved, and the original replica identity 'd' is restored.
+-- 3a) no replica identity + a usable btree index, force_advanced_logical: the
+--     existing index is built early on the destination shard (not a second time),
+--     the move succeeds, data is preserved, and the original replica identity 'd' is
+--     restored.
 --
 CREATE TABLE t_early_idx (a int, b text);
 CREATE INDEX t_early_idx_a ON t_early_idx (a);
@@ -251,7 +246,7 @@ SELECT min(shardid) AS shardid_early FROM pg_dist_shard WHERE logicalrelid='t_ea
 SELECT nodeport AS src_early,
        CASE WHEN nodeport = :worker_1_port THEN :worker_2_port ELSE :worker_1_port END AS tgt_early
 FROM pg_dist_shard_placement WHERE shardid = :shardid_early \gset
-SELECT citus_move_shard_placement(:shardid_early, 'localhost', :src_early, 'localhost', :tgt_early, shard_transfer_mode:='auto');
+SELECT citus_move_shard_placement(:shardid_early, 'localhost', :src_early, 'localhost', :tgt_early, shard_transfer_mode:='force_advanced_logical');
  citus_move_shard_placement
 ---------------------------------------------------------------------
 
@@ -300,7 +295,7 @@ SELECT min(shardid) AS shardid_epartial FROM pg_dist_shard WHERE logicalrelid='t
 SELECT nodeport AS src_epartial,
        CASE WHEN nodeport = :worker_1_port THEN :worker_2_port ELSE :worker_1_port END AS tgt_epartial
 FROM pg_dist_shard_placement WHERE shardid = :shardid_epartial \gset
-SELECT citus_move_shard_placement(:shardid_epartial, 'localhost', :src_epartial, 'localhost', :tgt_epartial, shard_transfer_mode:='auto');
+SELECT citus_move_shard_placement(:shardid_epartial, 'localhost', :src_epartial, 'localhost', :tgt_epartial, shard_transfer_mode:='force_advanced_logical');
  citus_move_shard_placement
 ---------------------------------------------------------------------
 
@@ -324,21 +319,18 @@ SELECT DISTINCT result FROM run_command_on_placements('t_early_partial', 'SELECT
  1
 (1 row)
 
-RESET citus.create_existing_indexes_early_for_logical_replication;
-RESET citus.set_replica_identity_full_for_logical_replication;
 --
--- SECTION 4: citus.create_temporary_indexes_for_logical_replication builds a
---            throwaway helper btree index on the destination shard of a table that
---            has no usable index, and drops it when the move finishes. Uses
---            force_logical so the admission GUC is not required.
+-- SECTION 4: under force_advanced_logical a throwaway helper btree index is built
+--            on the destination shard of a table that has no usable index, and
+--            dropped when the move finishes.
 --
 --
--- 4a) no replica identity + no index, force_logical, temp GUC on: the helper index
---     is built and dropped, the move succeeds, data is preserved, and no helper
---     index (citus_ri_helper_%) is left behind. force_logical is used so no
---     admission GUC is needed; there are no concurrent writes, so the move is safe
---     even though Citus does not set REPLICA IDENTITY FULL here (that is exercised
---     separately in section 2). The source replica identity stays at the default 'd'.
+-- 4a) no replica identity + no index, force_advanced_logical: the helper index is
+--     built and dropped, the move succeeds, data is preserved, and no helper index
+--     (citus_ri_helper_%) is left behind. Because the table has no replica identity,
+--     force_advanced_logical also sets REPLICA IDENTITY FULL on the source for the
+--     duration of the move and restores the original default 'd' afterwards, so the
+--     surviving placement ends up back at 'd'.
 --
 CREATE TABLE t_temp (a int, b text, c int);
 SELECT create_distributed_table('t_temp', 'a', colocate_with:='none');
@@ -352,14 +344,12 @@ SELECT min(shardid) AS shardid_temp FROM pg_dist_shard WHERE logicalrelid='t_tem
 SELECT nodeport AS src_temp,
        CASE WHEN nodeport = :worker_1_port THEN :worker_2_port ELSE :worker_1_port END AS tgt_temp
 FROM pg_dist_shard_placement WHERE shardid = :shardid_temp \gset
-SET citus.create_temporary_indexes_for_logical_replication TO on;
-SELECT citus_move_shard_placement(:shardid_temp, 'localhost', :src_temp, 'localhost', :tgt_temp, shard_transfer_mode:='force_logical');
+SELECT citus_move_shard_placement(:shardid_temp, 'localhost', :src_temp, 'localhost', :tgt_temp, shard_transfer_mode:='force_advanced_logical');
  citus_move_shard_placement
 ---------------------------------------------------------------------
 
 (1 row)
 
-RESET citus.create_temporary_indexes_for_logical_replication;
 SELECT public.wait_for_resource_cleanup();
  wait_for_resource_cleanup
 ---------------------------------------------------------------------
@@ -381,7 +371,7 @@ FROM run_command_on_placements('t_temp', 'SELECT count(*) FROM pg_class WHERE re
  f
 (1 row)
 
--- source replica identity unchanged (default 'd')
+-- source replica identity restored to the default 'd'
 SELECT DISTINCT result FROM run_command_on_placements('t_temp', 'SELECT relreplident FROM pg_class WHERE oid = ''%s''::regclass');
  result
 ---------------------------------------------------------------------
@@ -392,9 +382,9 @@ SELECT DISTINCT result FROM run_command_on_placements('t_temp', 'SELECT relrepli
 -- 4b) The temp helper also covers a table the user explicitly set to REPLICA
 --     IDENTITY FULL that has no index. Such a table can already publish all its
 --     modifications, so Citus never touches its replica identity, but the subscriber
---     would still sequential-scan the destination shard during catch-up. With the
---     temp GUC on a helper index is built (and dropped afterwards) for it too, and
---     the user's REPLICA IDENTITY FULL is left untouched ('f').
+--     would still sequential-scan the destination shard during catch-up. Under
+--     force_advanced_logical a helper index is built (and dropped afterwards) for it
+--     too, and the user's REPLICA IDENTITY FULL is left untouched ('f').
 --
 CREATE TABLE t_temp_full (a int, b text, c int);
 SELECT create_distributed_table('t_temp_full', 'a', colocate_with:='none');
@@ -409,14 +399,12 @@ SELECT min(shardid) AS shardid_tempfull FROM pg_dist_shard WHERE logicalrelid='t
 SELECT nodeport AS src_tempfull,
        CASE WHEN nodeport = :worker_1_port THEN :worker_2_port ELSE :worker_1_port END AS tgt_tempfull
 FROM pg_dist_shard_placement WHERE shardid = :shardid_tempfull \gset
-SET citus.create_temporary_indexes_for_logical_replication TO on;
-SELECT citus_move_shard_placement(:shardid_tempfull, 'localhost', :src_tempfull, 'localhost', :tgt_tempfull, shard_transfer_mode:='force_logical');
+SELECT citus_move_shard_placement(:shardid_tempfull, 'localhost', :src_tempfull, 'localhost', :tgt_tempfull, shard_transfer_mode:='force_advanced_logical');
  citus_move_shard_placement
 ---------------------------------------------------------------------
 
 (1 row)
 
-RESET citus.create_temporary_indexes_for_logical_replication;
 SELECT public.wait_for_resource_cleanup();
  wait_for_resource_cleanup
 ---------------------------------------------------------------------

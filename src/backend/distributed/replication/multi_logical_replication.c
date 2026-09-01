@@ -107,38 +107,6 @@ static const char *subscriptionRolePrefix[] = {
 /* GUC variable, defaults to 2 hours */
 int LogicalReplicationTimeout = 2 * 60 * 60 * 1000;
 
-/*
- * GUC variable. When true, Citus builds a temporary "helper" index on the
- * destination shard during a logical-replication based transfer for tables that
- * lack both a replica identity and a usable index, so that the subscriber can
- * use an index scan (instead of a sequential scan) while applying changes. The
- * index is dropped once the transfer completes. Defaults to off.
- */
-bool CreateTemporaryIndexesForLogicalReplication = false;
-
-/*
- * GUC variable. When true, before publishing the source shards of a
- * logical-replication based transfer, Citus sets REPLICA IDENTITY FULL on the
- * source shard of any table that has neither a replica identity nor a primary
- * key, so that the table's UPDATE/DELETE commands become publishable. Without
- * this the publisher rejects UPDATE/DELETE on such a table, which would break
- * the user's concurrent writes for the duration of the transfer. The original
- * replica identity is restored on completion (or by the cleanup daemon on
- * failure). Defaults to off, in which case Citus never changes a shard's replica
- * identity and behaves exactly as it did before this setting existed.
- */
-bool SetReplicaIdentityFullForLogicalReplication = false;
-
-/*
- * GUC variable. When true, if a table lacks an early-built replica identity index
- * (i.e. it has no primary key and no REPLICA IDENTITY USING INDEX) but does have
- * an existing index the subscriber can use under REPLICA IDENTITY FULL, Citus
- * builds that index on the destination shard early (right after the initial COPY,
- * before the catch-up) instead of in the late post-load phase. This lets the
- * subscriber use an index scan during the bulk catch-up. Defaults to off.
- */
-bool CreateExistingIndexesEarlyForLogicalReplication = false;
-
 
 /* see the comment in master_move_shard_placement */
 bool PlacementMovedUsingLogicalReplicationInTX = false;
@@ -153,8 +121,11 @@ static List * GetIndexCommandListForShardBackingReplicaIdentity(Oid relationId,
 																uint64 shardId);
 static void CreatePostLogicalReplicationDataLoadObjects(List *logicalRepTargetList,
 														LogicalRepType type,
-														bool skipInterShardRelationships);
-static void ExecuteCreateIndexCommands(List *logicalRepTargetList, LogicalRepType type);
+														bool skipInterShardRelationships,
+														bool useAdvancedLogicalReplication
+														);
+static void ExecuteCreateIndexCommands(List *logicalRepTargetList, LogicalRepType type,
+									   bool useAdvancedLogicalReplication);
 static void ExecuteCreateConstraintsBackedByIndexCommands(List *logicalRepTargetList);
 static List * ConvertNonExistingPlacementDDLCommandsToTasks(List *shardCommandList,
 															char *targetNodeName,
@@ -177,9 +148,13 @@ static void WaitForGroupedLogicalRepTargetsToCatchUp(XLogRecPtr sourcePosition,
 													 groupedLogicalRepTargets);
 static void CreateTemporaryReplicaIdentityFullIndexes(List *shardList,
 													  MultiConnection *sourceConnection,
-													  WorkerNode *targetNode);
+													  WorkerNode *targetNode,
+													  bool useAdvancedLogicalReplication);
 static void CreateEarlyExistingIndexesForLogicalReplication(List *shardList,
-															WorkerNode *targetNode);
+															WorkerNode *targetNode,
+															bool
+															useAdvancedLogicalReplication)
+;
 static char * ChooseHelperIndexColumn(MultiConnection *sourceConnection,
 									  ShardInterval *shardInterval);
 
@@ -196,7 +171,8 @@ static char * ChooseHelperIndexColumn(MultiConnection *sourceConnection,
 void
 LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePort,
 						 char *targetNodeName, int targetNodePort,
-						 bool skipInterShardRelationshipCreation)
+						 bool skipInterShardRelationshipCreation,
+						 bool useAdvancedLogicalReplication)
 {
 	char *superUser = CitusExtensionOwnerName();
 	char *databaseName = get_database_name(MyDatabaseId);
@@ -240,7 +216,8 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 		GetReplicationConnection(sourceConnection->hostname, sourceConnection->port);
 
 	/* set up the publication on the source and subscription on the target */
-	PrepareReplicaIdentitiesForPublication(sourceConnection, publicationInfoHash);
+	PrepareReplicaIdentitiesForPublication(sourceConnection, publicationInfoHash,
+										   useAdvancedLogicalReplication);
 	CreatePublications(sourceConnection, publicationInfoHash);
 	char *snapshot = CreateReplicationSlots(
 		sourceConnection,
@@ -297,11 +274,12 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 	 * the subscriber can use an index scan (instead of a sequential scan) while
 	 * applying the changes that are replicated during the catch-up below. This only
 	 * does something for tables that have neither a replica identity nor a usable
-	 * index, and only when explicitly enabled via
-	 * citus.create_temporary_indexes_for_logical_replication. It must run before the
-	 * subscriptions are enabled (which happens in CompleteNonBlockingShardTransfer).
+	 * index, and only in the force_advanced_logical shard transfer mode. It must run
+	 * before the subscriptions are enabled (which happens in
+	 * CompleteNonBlockingShardTransfer).
 	 */
-	CreateTemporaryReplicaIdentityFullIndexes(shardList, sourceConnection, targetNode);
+	CreateTemporaryReplicaIdentityFullIndexes(shardList, sourceConnection, targetNode,
+											  useAdvancedLogicalReplication);
 
 	/*
 	 * Optionally build one of each table's existing usable indexes early on the
@@ -310,10 +288,11 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 	 * Unlike the temporary helper index above, this reuses one of the table's own
 	 * indexes and keeps it permanently (it is excluded from the late CREATE INDEX
 	 * phase instead of being dropped). It only does something for tables that have a
-	 * usable index but no replica identity / primary key index, and only when
-	 * explicitly enabled via citus.create_existing_indexes_early_for_logical_replication.
+	 * usable index but no replica identity / primary key index, and only in the
+	 * force_advanced_logical shard transfer mode.
 	 */
-	CreateEarlyExistingIndexesForLogicalReplication(shardList, targetNode);
+	CreateEarlyExistingIndexesForLogicalReplication(shardList, targetNode,
+													useAdvancedLogicalReplication);
 
 	/*
 	 * Start the replication and copy all data
@@ -324,7 +303,8 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 									 logicalRepTargetList,
 									 groupedLogicalRepTargetsHash,
 									 SHARD_MOVE,
-									 skipInterShardRelationshipCreation);
+									 skipInterShardRelationshipCreation,
+									 useAdvancedLogicalReplication);
 
 	/*
 	 * We use these connections exclusively for subscription management,
@@ -360,16 +340,17 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
  * transfer the destination shard placement itself is dropped first (it sorts before
  * the index in the cleanup order), and the DROP INDEX IF EXISTS then becomes a no-op.
  *
- * This is gated by citus.create_temporary_indexes_for_logical_replication and is a
- * no-op unless that setting is enabled. It only ever touches the destination shard,
- * which is not yet visible to users, so a plain (blocking) CREATE INDEX is safe.
+ * This only does something in the force_advanced_logical shard transfer mode. It
+ * only ever touches the destination shard, which is not yet visible to users, so a
+ * plain (blocking) CREATE INDEX is safe.
  */
 static void
 CreateTemporaryReplicaIdentityFullIndexes(List *shardList,
 										  MultiConnection *sourceConnection,
-										  WorkerNode *targetNode)
+										  WorkerNode *targetNode,
+										  bool useAdvancedLogicalReplication)
 {
-	if (!CreateTemporaryIndexesForLogicalReplication)
+	if (!useAdvancedLogicalReplication)
 	{
 		return;
 	}
@@ -462,14 +443,15 @@ CreateTemporaryReplicaIdentityFullIndexes(List *shardList,
  * produced by GetEarlyBuiltIndexCommandList, which uses the same code path as the late
  * phase, so the two are byte-for-byte consistent.
  *
- * This is gated by citus.create_existing_indexes_early_for_logical_replication and is a
- * no-op unless that setting is enabled. It only ever touches the destination shard,
- * which is not yet visible to users, so a plain (blocking) CREATE INDEX is safe.
+ * This only does something in the force_advanced_logical shard transfer mode. It
+ * only ever touches the destination shard, which is not yet visible to users, so a
+ * plain (blocking) CREATE INDEX is safe.
  */
 static void
-CreateEarlyExistingIndexesForLogicalReplication(List *shardList, WorkerNode *targetNode)
+CreateEarlyExistingIndexesForLogicalReplication(List *shardList, WorkerNode *targetNode,
+												bool useAdvancedLogicalReplication)
 {
-	if (!CreateExistingIndexesEarlyForLogicalReplication)
+	if (!useAdvancedLogicalReplication)
 	{
 		return;
 	}
@@ -659,7 +641,8 @@ CompleteNonBlockingShardTransfer(List *shardList,
 								 List *logicalRepTargetList,
 								 HTAB *groupedLogicalRepTargetsHash,
 								 LogicalRepType type,
-								 bool skipInterShardRelationshipCreation)
+								 bool skipInterShardRelationshipCreation,
+								 bool useAdvancedLogicalReplication)
 {
 	/* Start applying the changes from the replication slots to catch up. */
 	EnableSubscriptions(logicalRepTargetList);
@@ -688,7 +671,8 @@ CompleteNonBlockingShardTransfer(List *shardList,
 	 * catches up again. So we don't block writes too long.
 	 */
 	CreatePostLogicalReplicationDataLoadObjects(logicalRepTargetList, type,
-												skipInterShardRelationshipCreation);
+												skipInterShardRelationshipCreation,
+												useAdvancedLogicalReplication);
 
 	UpdatePlacementUpdateStatusForShardIntervalList(
 		shardList,
@@ -1000,7 +984,8 @@ GetReplicaIdentityCommandListForShard(Oid relationId, uint64 shardId)
 static void
 CreatePostLogicalReplicationDataLoadObjects(List *logicalRepTargetList,
 											LogicalRepType type,
-											bool skipInterShardRelationships)
+											bool skipInterShardRelationships,
+											bool useAdvancedLogicalReplication)
 {
 	/*
 	 * We create indexes in 4 steps.
@@ -1016,7 +1001,8 @@ CreatePostLogicalReplicationDataLoadObjects(List *logicalRepTargetList,
 	 *  table and setting the statistics of indexes, depends on the indexes being
 	 *  created. That's why the execution is divided into four distinct stages.
 	 */
-	ExecuteCreateIndexCommands(logicalRepTargetList, type);
+	ExecuteCreateIndexCommands(logicalRepTargetList, type,
+							   useAdvancedLogicalReplication);
 	ExecuteCreateConstraintsBackedByIndexCommands(logicalRepTargetList);
 	ExecuteClusterOnCommands(logicalRepTargetList);
 	ExecuteCreateIndexStatisticsCommands(logicalRepTargetList);
@@ -1046,7 +1032,8 @@ CreatePostLogicalReplicationDataLoadObjects(List *logicalRepTargetList,
  * commands fail.
  */
 static void
-ExecuteCreateIndexCommands(List *logicalRepTargetList, LogicalRepType type)
+ExecuteCreateIndexCommands(List *logicalRepTargetList, LogicalRepType type,
+						   bool useAdvancedLogicalReplication)
 {
 	List *taskList = NIL;
 	LogicalRepTarget *target = NULL;
@@ -1058,15 +1045,16 @@ ExecuteCreateIndexCommands(List *logicalRepTargetList, LogicalRepType type)
 			Oid relationId = shardInterval->relationId;
 
 			/*
-			 * For a shard move we may have built one of the table's existing indexes
-			 * early on the destination shard (see
-			 * CreateEarlyExistingIndexesForLogicalReplication); if so, that index must
-			 * be excluded here so it is not created a second time. For a shard split we
-			 * never build indexes early, so we use the regular exclusion. Both variants
-			 * only ever additionally skip the index backing the replica identity.
+			 * For a shard move in the force_advanced_logical mode we may have
+			 * built one of the table's existing indexes early on the destination
+			 * shard (see CreateEarlyExistingIndexesForLogicalReplication); if so,
+			 * that index must be excluded here so it is not created a second time.
+			 * In any other case (a shard split, or a shard move that did not build
+			 * an index early) we use the regular exclusion. Both variants only ever
+			 * additionally skip the index backing the replica identity.
 			 */
 			List *tableCreateIndexCommandList = NIL;
-			if (type == SHARD_MOVE)
+			if (type == SHARD_MOVE && useAdvancedLogicalReplication)
 			{
 				tableCreateIndexCommandList =
 					GetTableIndexAndConstraintCommandsExcludingReplicaIdentityAndEarlyBuiltIndex
@@ -1670,17 +1658,18 @@ GetQueryResultStringList(MultiConnection *connection, char *query)
  */
 void
 PrepareReplicaIdentitiesForPublication(MultiConnection *connection,
-									   HTAB *publicationInfoHash)
+									   HTAB *publicationInfoHash,
+									   bool useAdvancedLogicalReplication)
 {
-	if (!SetReplicaIdentityFullForLogicalReplication)
+	if (!useAdvancedLogicalReplication)
 	{
 		/*
-		 * The user has not opted in to letting Citus change a shard's replica
-		 * identity, so we leave every shard untouched. A table that lacks a
-		 * replica identity is then handled exactly as before this setting
-		 * existed: in "auto" mode VerifyTablesHaveReplicaIdentity errors out
-		 * before we get here, and with force_logical the transfer proceeds but
-		 * the publisher rejects the user's concurrent UPDATE/DELETE.
+		 * Outside the force_advanced_logical shard transfer mode we leave every
+		 * shard untouched. A table that lacks a replica identity is then handled
+		 * exactly as before this mode existed: in "auto" mode
+		 * VerifyTablesHaveReplicaIdentity errors out before we get here, and with
+		 * force_logical the transfer proceeds but the publisher rejects the user's
+		 * concurrent UPDATE/DELETE.
 		 */
 		return;
 	}

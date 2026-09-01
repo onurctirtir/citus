@@ -927,8 +927,8 @@ GetTableIndexAndConstraintCommandsExcludingReplicaIdentityAndEarlyBuiltIndex(Oid
  * GatherIndexAndConstraintDefinitionListExcludingReplicaIdentityAndEarlyBuiltIndex is
  * a wrapper around GatherIndexAndConstraintDefinitionList() which excludes both the
  * index backing the replica identity and the existing index that Citus built early on
- * the destination shard (only when that behavior is enabled via
- * citus.create_existing_indexes_early_for_logical_replication).
+ * the destination shard. This variant is only ever used for a force_advanced_logical
+ * shard move, where that early build actually happened.
  */
 static void
 GatherIndexAndConstraintDefinitionListExcludingReplicaIdentityAndEarlyBuiltIndex(
@@ -946,12 +946,14 @@ GatherIndexAndConstraintDefinitionListExcludingReplicaIdentityAndEarlyBuiltIndex
 		return;
 	}
 
-	if (CreateExistingIndexesEarlyForLogicalReplication &&
-		ChooseExistingIndexToBuildEarly(relationId) == indexForm->indexrelid)
+	if (ChooseExistingIndexToBuildEarly(relationId) == indexForm->indexrelid)
 	{
 		/*
 		 * We already built this index early on the destination shard, so skip it
-		 * here to avoid creating it a second time.
+		 * here to avoid creating it a second time. This code path is reached only
+		 * for a force_advanced_logical shard move, where that early build actually
+		 * happened (see the caller ExecuteCreateIndexCommands), so the choice made
+		 * here always agrees with what was built.
 		 */
 		table_close(relation, NoLock);
 		return;

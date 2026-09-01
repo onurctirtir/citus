@@ -27,31 +27,6 @@ extern int LogicalReplicationTimeout;
 extern bool PlacementMovedUsingLogicalReplicationInTX;
 
 /*
- * When enabled, Citus builds a temporary index on the destination shard of a
- * logical-replication based transfer for tables that have neither a replica
- * identity nor a usable index, so the subscriber can locate rows with an index
- * scan instead of a sequential scan. Defaults to off.
- */
-extern bool CreateTemporaryIndexesForLogicalReplication;
-
-/*
- * When enabled, Citus sets REPLICA IDENTITY FULL on the source shard of any table
- * that has neither a replica identity nor a primary key before publishing it for
- * a logical-replication based transfer, so the table's UPDATE/DELETE become
- * publishable. The original replica identity is restored afterwards. Defaults to
- * off, in which case Citus never changes a shard's replica identity.
- */
-extern bool SetReplicaIdentityFullForLogicalReplication;
-
-/*
- * When enabled, Citus builds a table's existing subscriber-usable index on the
- * destination shard early (right after the initial COPY) instead of in the late
- * post-load phase, so the subscriber can use an index scan during the bulk
- * catch-up of a logical-replication based transfer. Defaults to off.
- */
-extern bool CreateExistingIndexesEarlyForLogicalReplication;
-
-/*
  * NodeAndOwner should be used as a key for structs that should be hashed by a
  * combination of node and owner.
  */
@@ -157,7 +132,8 @@ typedef enum LogicalRepType
 extern void LogicallyReplicateShards(List *shardList, char *sourceNodeName,
 									 int sourceNodePort, char *targetNodeName,
 									 int targetNodePort,
-									 bool skipInterShardRelationshipCreation);
+									 bool skipInterShardRelationshipCreation,
+									 bool useAdvancedLogicalReplication);
 
 extern void ConflictWithIsolationTestingBeforeCopy(void);
 extern void ConflictWithIsolationTestingAfterCopy(void);
@@ -170,7 +146,8 @@ extern List * GetQueryResultStringList(MultiConnection *connection, char *query)
 
 extern MultiConnection * GetReplicationConnection(char *nodeName, int nodePort);
 extern void PrepareReplicaIdentitiesForPublication(MultiConnection *sourceConnection,
-												   HTAB *publicationInfoHash);
+												   HTAB *publicationInfoHash,
+												   bool useAdvancedLogicalReplication);
 extern void CreatePublications(MultiConnection *sourceConnection,
 							   HTAB *publicationInfoHash);
 extern void CreateSubscriptions(MultiConnection *sourceConnection,
@@ -206,7 +183,8 @@ extern void CompleteNonBlockingShardTransfer(List *shardList,
 											 List *logicalRepTargetList,
 											 HTAB *groupedLogicalRepTargetsHash,
 											 LogicalRepType type,
-											 bool skipInterShardRelationshipCreation);
+											 bool skipInterShardRelationshipCreation,
+											 bool useAdvancedLogicalReplication);
 extern void CreateUncheckedForeignKeyConstraints(List *logicalRepTargetList);
 extern void CreatePartitioningHierarchy(List *logicalRepTargetList);
 
