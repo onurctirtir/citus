@@ -546,7 +546,10 @@ GetDependencyCreateDDLCommands(const ObjectAddress *dependency)
  *   2. DROP TABLE IF EXISTS the shell table (idempotency),
  *   3. the full shell table creation commands
  *      (GetFullTableCreationCommands with creatingShellTableOnRemoteNode=true),
- *      which re-record the sequence dependency during creation.
+ *      which re-record the sequence dependency during creation, and
+ *   4. for bundle-eligible tables, the pg_dist_partition insert
+ *      (DistributionCreateCommand) so it commits in the same remote transaction
+ *      as the shell table (see ShouldBundlePartitionMetadataWithShellTable).
  *
  * This is the single source of truth for the shell table bundle: both
  * GetDependencyCreateDDLCommands() (serial dependency path) and the parallel
@@ -578,6 +581,21 @@ ShellTableCreationCommandList(Oid relationId)
 	 */
 	commandList = lcons(DropTableIfExistsCommand(relationId), commandList);
 	commandList = lcons(WorkerDropSequenceDependencyCommand(relationId), commandList);
+
+	/*
+	 * Bundle the pg_dist_partition insert with the shell table CREATE so the two
+	 * commit together in a single remote transaction (see
+	 * ShouldBundlePartitionMetadataWithShellTable). This keeps the shell table
+	 * and its pg_dist_partition row in lockstep even across an interrupted sync,
+	 * so the next sync's pg_dist_partition-driven drop-and-recreate can reach a
+	 * drifted shell table. Extension-owned (and non-synced) shell tables are
+	 * excluded; SendDistTableMetadataCommands still syncs their row.
+	 */
+	if (ShouldBundlePartitionMetadataWithShellTable(relationId))
+	{
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
+		commandList = lappend(commandList, DistributionCreateCommand(cacheEntry));
+	}
 
 	return commandList;
 }
