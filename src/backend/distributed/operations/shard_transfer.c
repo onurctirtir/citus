@@ -34,6 +34,8 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+#include "pg_version_constants.h"
+
 #include "distributed/adaptive_executor.h"
 #include "distributed/backend_data.h"
 #include "distributed/citus_ruleutils.h"
@@ -1558,6 +1560,29 @@ RelationCanPublishAllModifications(Oid relationId)
 
 	return canPublish;
 }
+
+
+/*
+ * The eligibility predicate in RelationHasUsableReplicaIdentityFullIndex below (and
+ * its twins in node_protocol.c's ChooseExistingIndexToBuildEarly and the temporary
+ * helper-index builder in multi_logical_replication.c) is intentionally a strict
+ * subset of PostgreSQL's subscriber-side IsIndexUsableForReplicaIdentityFull. Those
+ * acceptance rules are version dependent: PostgreSQL 16 requires a btree index,
+ * PostgreSQL 17 generalized it to any access method that has a valid equality
+ * strategy, and PostgreSQL 18 additionally checks per-column equality. A valid,
+ * non-partial btree whose leftmost key is a plain column has been usable on every
+ * supported version so far, so requiring exactly that shape is safe everywhere and
+ * only ever costs a subscriber-side index scan optimization, never correctness.
+ *
+ * Citus currently supports PostgreSQL 16, 17 and 18. When adding support for a new
+ * major PostgreSQL version, re-read IsIndexUsableForReplicaIdentityFull for that
+ * version, confirm the predicate below is still a subset of what the subscriber
+ * accepts, and then bump the guard here.
+ */
+#if PG_VERSION_NUM >= PG_VERSION_19
+#error \
+	"Unsupported PostgreSQL major version: re-verify IsIndexUsableForReplicaIdentityFull acceptance rules before enabling force_advanced_logical shard transfers on this version."
+#endif
 
 
 /*

@@ -443,6 +443,31 @@ SELECT count(*) AS leftover_cleanup_records FROM pg_dist_cleanup;
                         0
 (1 row)
 
+--
+-- SECTION 5: force_advanced_logical is a shard-MOVE-only capability. It only
+--            changes how LogicallyReplicateShards performs logical replication.
+--            Shard splits and tenant isolation (a split under the hood) do not go
+--            through that path, so they must reject the mode explicitly in
+--            LookupSplitMode instead of silently downgrading to a plain
+--            non-blocking split.
+--
+CREATE TABLE reject_split (a int, b int);
+SELECT create_distributed_table('reject_split', 'a', colocate_with:='none');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT min(shardid) AS shardid_reject FROM pg_dist_shard WHERE logicalrelid='reject_split'::regclass \gset
+-- citus_split_shard_by_split_points rejects force_advanced_logical
+SELECT citus_split_shard_by_split_points(:shardid_reject, ARRAY['-1500000000'], ARRAY[1, 2], 'force_advanced_logical');
+ERROR:  shard transfer mode 'force_advanced_logical' is not supported for shard splits or tenant isolation
+HINT:  Use 'force_logical', 'auto' or 'block_writes' instead.
+-- isolate_tenant_to_new_shard (tenant isolation) rejects force_advanced_logical
+SELECT isolate_tenant_to_new_shard('reject_split', 5, shard_transfer_mode:='force_advanced_logical');
+ERROR:  shard transfer mode 'force_advanced_logical' is not supported for shard splits or tenant isolation
+HINT:  Use 'force_logical', 'auto' or 'block_writes' instead.
+DROP TABLE reject_split;
 -- strong check: no shard of this schema on any worker is left with REPLICA
 -- IDENTITY FULL ('f'). All table creation is already done, so it is safe to
 -- switch connections (which resets session GUCs) from here on.
