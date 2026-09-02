@@ -176,6 +176,9 @@ static bool MetadataSyncShellTablePoolEnabled(MetadataSyncContext *context);
 static bool IsCitusShellTableDependency(const ObjectAddress *dependency);
 static bool IsDependentOnShellTableObject(const ObjectAddress *dependency);
 static void SendDeferredDependentCreationCommands(MetadataSyncContext *context);
+static void LogMetadataSyncPhaseBoundary(const char *state, const char *phase);
+static void LogMetadataSyncProgress(const char *label, int64 previousCount,
+									int64 currentCount, int64 totalCount);
 typedef List *(*NodeTargetedPoolDeparseFn)(HeapTuple tuple, TupleDesc tupleDesc,
 										   MetadataSyncContext *context);
 static void RunNodeTargetedPoolPhase(MetadataSyncContext *context,
@@ -304,6 +307,13 @@ static bool got_SIGTERM = false;
 static bool got_SIGALRM = false;
 
 #define METADATA_SYNC_APP_NAME "Citus Metadata Sync Daemon"
+
+/*
+ * Emit a metadata-sync progress LOG line once each time a long per-object loop's
+ * running count crosses a multiple of this interval. Purely observational; it does
+ * not affect batching or memory.
+ */
+#define METADATA_SYNC_PROGRESS_LOG_INTERVAL 1000
 
 
 /*
@@ -5041,7 +5051,9 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	Assert(ShouldPropagate());
 
 	/* Send systemwide objects, only roles for now */
+	LogMetadataSyncPhaseBoundary("starting", "node-wide objects");
 	SendNodeWideObjectsSyncCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "node-wide objects");
 
 	/*
 	 * Break dependencies between sequences-shell tables, then remove shell tables,
@@ -5049,21 +5061,30 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	 * We should delete shell tables before metadata entries as we look inside
 	 * pg_dist_partition to figure out shell tables.
 	 */
+	LogMetadataSyncPhaseBoundary("starting", "shell table deletion");
 	SendShellTableDeletionCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "shell table deletion");
+
+	LogMetadataSyncPhaseBoundary("starting", "metadata deletion");
 	SendMetadataDeletionCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "metadata deletion");
 
 	/*
 	 * Commands to insert pg_dist_colocation entries.
 	 * Replicating dist objects and their metadata depends on this step.
 	 */
+	LogMetadataSyncPhaseBoundary("starting", "colocation metadata");
 	SendColocationMetadataCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "colocation metadata");
 
 	/*
 	 * Replicate all objects of the pg_dist_object to the remote node and
 	 * create metadata entries for Citus tables (pg_dist_shard, pg_dist_shard_placement,
 	 * pg_dist_partition, pg_dist_object).
 	 */
+	LogMetadataSyncPhaseBoundary("starting", "dependency creation");
 	SendDependencyCreationCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "dependency creation");
 
 	/*
 	 * When the pool path is enabled, SendDependencyCreationCommands above also
@@ -5076,7 +5097,9 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	 */
 	if (MetadataSyncShellTablePoolEnabled(context))
 	{
+		LogMetadataSyncPhaseBoundary("starting", "parallel sequence creation");
 		SendSequenceCreationCommandsViaPool(context);
+		LogMetadataSyncPhaseBoundary("finished", "parallel sequence creation");
 	}
 
 	/*
@@ -5090,7 +5113,9 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	 */
 	if (MetadataSyncShellTablePoolEnabled(context))
 	{
+		LogMetadataSyncPhaseBoundary("starting", "parallel shell table creation");
 		SendShellTableCreationCommandsViaPool(context);
+		LogMetadataSyncPhaseBoundary("finished", "parallel shell table creation");
 	}
 
 	/*
@@ -5101,7 +5126,9 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	 * and before the per-table metadata below). In the serial path the deferred
 	 * list is empty, so this is a no-op.
 	 */
+	LogMetadataSyncPhaseBoundary("starting", "deferred dependent object creation");
 	SendDeferredDependentCreationCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "deferred dependent object creation");
 
 	/*
 	 * The per-table shard/partition metadata (pg_dist_shard, pg_dist_shard_
@@ -5126,8 +5153,13 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	 * reserve the pool for the shell-table and sequence layers, where per-object
 	 * worker CPU dominates and K-way concurrency wins.
 	 */
+	LogMetadataSyncPhaseBoundary("starting", "dist table metadata");
 	SendDistTableMetadataCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "dist table metadata");
+
+	LogMetadataSyncPhaseBoundary("starting", "dist object metadata");
 	SendDistObjectCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "dist object metadata");
 
 	/*
 	 * Commands to insert pg_dist_schema entries.
@@ -5135,13 +5167,66 @@ SyncDistributedObjects(MetadataSyncContext *context)
 	 * Need to be done after syncing distributed objects because the schemas
 	 * need to exist on the worker.
 	 */
+	LogMetadataSyncPhaseBoundary("starting", "tenant schema metadata");
 	SendTenantSchemaMetadataCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "tenant schema metadata");
 
 	/*
 	 * After creating each table, handle the inter table relationship between
 	 * those tables.
 	 */
+	LogMetadataSyncPhaseBoundary("starting", "inter-table relationship");
 	SendInterTableRelationshipCommands(context);
+	LogMetadataSyncPhaseBoundary("finished", "inter-table relationship");
+}
+
+
+/*
+ * LogMetadataSyncPhaseBoundary emits a single LOG line before and after each
+ * major metadata-sync phase in SyncDistributedObjects, so an operator can see
+ * which phase a long-running sync is currently in (and, from the log timestamps,
+ * how long each phase took) without attaching a debugger. state is "starting" or
+ * "finished"; phase names the step (e.g. "colocation metadata").
+ */
+static void
+LogMetadataSyncPhaseBoundary(const char *state, const char *phase)
+{
+	ereport(LOG, (errmsg("metadata sync: %s %s", state, phase)));
+}
+
+
+/*
+ * LogMetadataSyncProgress emits a periodic LOG line from the long per-object loops
+ * of metadata sync, once each time the running count crosses a multiple of
+ * METADATA_SYNC_PROGRESS_LOG_INTERVAL. previousCount/currentCount are the running
+ * counts before and after the current step (currentCount - previousCount is 1 for
+ * per-object loops and a whole batch for the set-batched loops), so the crossing
+ * check fires exactly once per interval regardless of the step size. When
+ * totalCount is positive it is shown as the denominator ("X / Y"); pass a
+ * non-positive value for the streaming loops whose total is not known up front
+ * (materializing it would defeat the bounded-memory scan).
+ */
+static void
+LogMetadataSyncProgress(const char *label, int64 previousCount, int64 currentCount,
+						int64 totalCount)
+{
+	int64 interval = METADATA_SYNC_PROGRESS_LOG_INTERVAL;
+
+	if (currentCount / interval == previousCount / interval)
+	{
+		return;
+	}
+
+	if (totalCount > 0)
+	{
+		ereport(LOG, (errmsg("metadata sync: processed %ld / %ld %s",
+							 (long) currentCount, (long) totalCount, label)));
+	}
+	else
+	{
+		ereport(LOG, (errmsg("metadata sync: processed %ld %s",
+							 (long) currentCount, label)));
+	}
 }
 
 
@@ -5416,8 +5501,18 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 														   ALLOCSET_DEFAULT_SIZES);
 	ObjectAddress *dependency = NULL;
 	int64 processedCount = 0;
+	int64 totalDependencies = list_length(dependencies);
 	foreach_ptr(dependency, dependencies)
 	{
+		/*
+		 * Advance the processed counter once at the top so all paths below (the
+		 * two pool-defer skips and the main creation path) share one count, and
+		 * emit a periodic progress line.
+		 */
+		processedCount++;
+		LogMetadataSyncProgress("dependency objects", processedCount - 1,
+								processedCount, totalDependencies);
+
 		MemoryContextReset(perObjectContext);
 		MemoryContextSwitchTo(perObjectContext);
 
@@ -5430,7 +5525,7 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 		 */
 		if (poolShellTables && IsCitusShellTableDependency(dependency))
 		{
-			FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+			FlushMetadataSyncCachesIfNeeded(context, processedCount);
 			continue;
 		}
 
@@ -5453,7 +5548,7 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 				lappend(context->deferredDependentObjectAddresses, deferredAddress);
 			MemoryContextSwitchTo(stashContext);
 
-			FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+			FlushMetadataSyncCachesIfNeeded(context, processedCount);
 			continue;
 		}
 
@@ -5474,7 +5569,7 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 		 * advance the cache-flush counter and flush if needed on this skip path
 		 * too.
 		 */
-		FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+		FlushMetadataSyncCachesIfNeeded(context, processedCount);
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -5682,6 +5777,24 @@ RunNodeTargetedPoolPhase(MetadataSyncContext *context, WorkerNode *workerNode,
 			 * millions of objects).
 			 */
 			FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+
+			/*
+			 * Emit a periodic progress line for this node's phase. objectCount
+			 * advances by exactly one per appended object, so the modulo fires
+			 * once every METADATA_SYNC_PROGRESS_LOG_INTERVAL objects. The total
+			 * is not known up front (the scan is streaming, by design), so only
+			 * the running count and wave count are reported here; the completion
+			 * LOG below prints the final totals.
+			 */
+			if (appended &&
+				objectCount % METADATA_SYNC_PROGRESS_LOG_INTERVAL == 0)
+			{
+				ereport(LOG, (errmsg("metadata sync: %s on node %s:%d in "
+									 "progress: %ld objects, %ld waves",
+									 objectLabel, workerNode->workerName,
+									 workerNode->workerPort,
+									 (long) objectCount, (long) waveCount)));
+			}
 		}
 
 		MemoryContextSwitchTo(waveContext);
@@ -6352,6 +6465,8 @@ SendDistTableMetadataCommands(MetadataSyncContext *context)
 		 * the metadata cache.
 		 */
 		FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+		LogMetadataSyncProgress("distributed tables (shard/placement metadata)",
+								processedCount - 1, processedCount, -1);
 
 		if (batchCount >= batchSize)
 		{
@@ -6800,8 +6915,11 @@ SendDistObjectCommands(MetadataSyncContext *context)
 			MemoryContextSwitchTo(prev);
 
 			SendOrCollectCommandListToActivatedNodes(context, commandList);
+			int64 previousCount = processedCount;
 			processedCount += batchCount;
 			FlushMetadataSyncCachesIfNeeded(context, processedCount);
+			LogMetadataSyncProgress("dist object marks", previousCount,
+									processedCount, -1);
 
 			MemoryContextReset(batchContext);
 			addresses = NIL;
@@ -6826,8 +6944,11 @@ SendDistObjectCommands(MetadataSyncContext *context)
 		MemoryContextSwitchTo(prev);
 
 		SendOrCollectCommandListToActivatedNodes(context, commandList);
+		int64 previousCount = processedCount;
 		processedCount += batchCount;
 		FlushMetadataSyncCachesIfNeeded(context, processedCount);
+		LogMetadataSyncProgress("dist object marks", previousCount,
+								processedCount, -1);
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -6908,6 +7029,8 @@ SendInterTableRelationshipCommands(MetadataSyncContext *context)
 		 * the cache-flush counter and flush if needed on this skip path too.
 		 */
 		FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
+		LogMetadataSyncProgress("tables scanned for inter-table relationships",
+								processedCount - 1, processedCount, -1);
 	}
 
 	MemoryContextSwitchTo(oldContext);
