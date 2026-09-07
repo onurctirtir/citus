@@ -69,6 +69,15 @@ typedef struct ObjectAddressCollector
 	HTAB *dependencySet;
 
 	HTAB *visitedObjects;
+
+	/*
+	 * When recordEdges is true, every direct dependency edge encountered during
+	 * the traversal (prereq -> dependent) is appended to edgeList as an
+	 * ObjectDependencyEdge. Used to expose the dependency graph (not just a flat
+	 * topological order) so callers can schedule independent objects in parallel.
+	 */
+	bool recordEdges;
+	List *edgeList;
 } ObjectAddressCollector;
 
 /*
@@ -158,6 +167,12 @@ static void MarkObjectVisited(ObjectAddressCollector *collector,
 							  ObjectAddress target);
 static bool TargetObjectVisited(ObjectAddressCollector *collector,
 								ObjectAddress target);
+static void RecordDependencyEdge(ObjectAddressCollector *collector,
+								 ObjectAddress prereq, ObjectAddress dependent);
+static List * OrderObjectAddressListInDependencyOrderInternal(List *objectAddressList,
+															  bool flushCaches,
+															  bool recordEdges,
+															  List **edgeList);
 
 typedef List *(*expandFn)(ObjectAddressCollector *collector, ObjectAddress target);
 typedef bool (*followFn)(ObjectAddressCollector *collector,
@@ -173,6 +188,7 @@ static List * DependencyDefinitionFromPgDepend(ObjectAddress target);
 static List * DependencyDefinitionFromPgShDepend(ObjectAddress target);
 static bool FollowAllSupportedDependencies(ObjectAddressCollector *collector,
 										   DependencyDefinition *definition);
+static bool IsSupportedCitusDependencyEdge(DependencyDefinition *definition);
 static bool FollowNewSupportedDependencies(ObjectAddressCollector *collector,
 										   DependencyDefinition *definition);
 static bool FollowAllDependencies(ObjectAddressCollector *collector,
@@ -317,9 +333,40 @@ GetAllCitusDependedDependenciesForObject(const ObjectAddress *target)
 
 
 /*
- * OrderObjectAddressListInDependencyOrder given a list of ObjectAddresses return a new
- * list of the same ObjectAddresses ordered on dependency order where dependencies
- * precedes the corresponding object in the list.
+ * OrderObjectAddressListInDependencyOrder is a wrapper around
+ * OrderObjectAddressListInDependencyOrderInternal that returns a new list of the
+ * same ObjectAddresses ordered on dependency order.
+ */
+List *
+OrderObjectAddressListInDependencyOrder(List *objectAddressList, bool flushCaches)
+{
+	return OrderObjectAddressListInDependencyOrderInternal(objectAddressList, flushCaches,
+														   false, NULL);
+}
+
+
+/*
+ * OrderObjectAddressListInDependencyOrderWithEdges is a wrapper around
+ * OrderObjectAddressListInDependencyOrderInternal that returns a new list of the
+ * same ObjectAddresses ordered on dependency order.
+ *
+ * It returns a list of edges representing the dependencies between the objects too.
+ */
+List *
+OrderObjectAddressListInDependencyOrderWithEdges(List *objectAddressList,
+												 bool flushCaches, List **edgeList)
+{
+	return OrderObjectAddressListInDependencyOrderInternal(objectAddressList, flushCaches,
+														   true, edgeList);
+}
+
+
+/*
+ * OrderObjectAddressListInDependencyOrderInternal is the shared implementation
+ * behind OrderObjectAddressListInDependencyOrder[WithEdges].
+ *
+ * Given a list of ObjectAddresses, returns a new list of the same ObjectAddresses ordered
+ * on dependency order where dependencies precedes the corresponding object in the list.
  *
  * The algortihm traveses pg_depend in a depth first order starting at the first object in
  * the provided list. By traversing depth first it will put the first dependency at the
@@ -330,12 +377,18 @@ GetAllCitusDependedDependenciesForObject(const ObjectAddress *target)
  *
  * When flushCaches is true, the caller opts into periodically flushing the coordinator
  * caches that grow while traversing pg_depend.
+ *
+ * When recordEdges is true the traversal also records the dependency graph edges into
+ * edgeList.
  */
-List *
-OrderObjectAddressListInDependencyOrder(List *objectAddressList, bool flushCaches)
+static List *
+OrderObjectAddressListInDependencyOrderInternal(List *objectAddressList,
+												bool flushCaches, bool recordEdges,
+												List **edgeList)
 {
 	ObjectAddressCollector collector = { 0 };
 	InitObjectAddressCollector(&collector);
+	collector.recordEdges = recordEdges;
 
 	ObjectAddress *objectAddress = NULL;
 	int64 processedCount = 0;
@@ -370,6 +423,11 @@ OrderObjectAddressListInDependencyOrder(List *objectAddressList, bool flushCache
 		}
 	}
 
+	if (edgeList != NULL)
+	{
+		*edgeList = collector.edgeList;
+	}
+
 	return collector.dependencyList;
 }
 
@@ -399,6 +457,17 @@ static void
 RecurseObjectDependencies(ObjectAddress target, expandFn expand, followFn follow,
 						  applyFn apply, ObjectAddressCollector *collector)
 {
+	/*
+	 * Edge recording below records an edge for every dependency that passes
+	 * IsSupportedCitusDependencyEdge(), which mirrors FollowAllSupportedDependencies()
+	 * minus its already-collected gate. That mirror is only correct while the traversal
+	 * itself is driven by FollowAllSupportedDependencies. recordEdges is only ever set on
+	 * the OrderObjectAddressListInDependencyOrderWithEdges() path, which passes exactly
+	 * that follow function; assert the coupling so a future caller that wires recordEdges
+	 * to a different follow trips here instead of silently producing a wrong edge set.
+	 */
+	Assert(!collector->recordEdges || follow == FollowAllSupportedDependencies);
+
 	if (TargetObjectVisited(collector, target))
 	{
 		/* prevent infinite loops due to circular dependencies */
@@ -424,6 +493,34 @@ RecurseObjectDependencies(ObjectAddress target, expandFn expand, followFn follow
 	DependencyDefinition *dependencyDefinition = NULL;
 	foreach_ptr(dependencyDefinition, dependenyDefinitionList)
 	{
+		ObjectAddress address = DependencyDefinitionObjectAddress(dependencyDefinition);
+
+		/*
+		 * Record the direct edge prereq(address) -> dependent(target) before the
+		 * follow() gate below. follow() (FollowAllSupportedDependencies) returns
+		 * false for a prerequisite that was already collected via another path
+		 * -- a re-traversal optimization -- but that prerequisite relationship is
+		 * still real: the dependent must not be created before the prereq exists.
+		 *
+		 * If we only recorded edges for followed entries (as the edge capture
+		 * originally did, after the gate), we would drop every "second and later"
+		 * edge into a shared prerequisite -- a role used by many schemas, a type
+		 * used by many functions -- leaving those dependents with an understated
+		 * in-degree.
+		 *
+		 * So IsSupportedCitusDependencyEdge() mirrors the "follow" filter minus
+		 * the already-collected gate, so the recorded edge set is a complete
+		 * superset of the real Citus-object prerequisite edges. A caller building
+		 * an in-degree graph restricts the edges to the object set it actually
+		 * creates, so an edge that references a filtered-out object is harmlessly
+		 * ignored there.
+		 */
+		if (collector->recordEdges &&
+			IsSupportedCitusDependencyEdge(dependencyDefinition))
+		{
+			RecordDependencyEdge(collector, address, target);
+		}
+
 		if (follow == NULL || !follow(collector, dependencyDefinition))
 		{
 			/* skip all pg_depend entries the user didn't want to follow */
@@ -434,7 +531,6 @@ RecurseObjectDependencies(ObjectAddress target, expandFn expand, followFn follow
 		 * recurse depth first, this makes sure we call apply for the deepest dependency
 		 * first.
 		 */
-		ObjectAddress address = DependencyDefinitionObjectAddress(dependencyDefinition);
 		RecurseObjectDependencies(address, expand, follow, apply, collector);
 
 		/* now apply changes for current entry */
@@ -563,6 +659,69 @@ InitObjectAddressCollector(ObjectAddressCollector *collector)
 
 	collector->visitedObjects = CreateSimpleHashSetWithName(ObjectAddress,
 															"visited object set");
+
+	collector->recordEdges = false;
+	collector->edgeList = NULL;
+}
+
+
+/*
+ * RecordDependencyEdge appends a direct dependency edge (prereq must be created
+ * before dependent) to the collector's edgeList. Only called while recordEdges
+ * is set. The edge is allocated in the current memory context, same as the
+ * collector's dependencyList, so it lives as long as the ordered output.
+ */
+static void
+RecordDependencyEdge(ObjectAddressCollector *collector, ObjectAddress prereq,
+					 ObjectAddress dependent)
+{
+	ObjectDependencyEdge *edge = palloc0(sizeof(ObjectDependencyEdge));
+	edge->prereq = prereq;
+	edge->dependent = dependent;
+
+	collector->edgeList = lappend(collector->edgeList, edge);
+}
+
+
+/*
+ * IsSupportedCitusDependencyEdge returns whether a dependency definition denotes
+ * a real Citus-created-object prerequisite that should be recorded as a dependency
+ * graph edge.
+ *
+ * It intentionally mirrors FollowAllSupportedDependencies() -- the follow filter
+ * used by the edge-recording traversal -- minus the "already collected" gate.
+ */
+static bool
+IsSupportedCitusDependencyEdge(DependencyDefinition *definition)
+{
+	if (definition->mode == DependencyPgDepend)
+	{
+		/*
+		 * Only normal and extension pg_depend dependencies denote a prerequisite
+		 * object; internal/auto dependencies are managed by postgres and are not
+		 * separately created by Citus.
+		 */
+		if (definition->data.pg_depend.deptype != DEPENDENCY_NORMAL &&
+			definition->data.pg_depend.deptype != DEPENDENCY_EXTENSION)
+		{
+			return false;
+		}
+	}
+
+	ObjectAddress address = DependencyDefinitionObjectAddress(definition);
+
+	if (!SupportedDependencyByCitus(&address) &&
+		!IsObjectAddressOwnedByExtension(&address, NULL))
+	{
+		return false;
+	}
+
+	if (CitusExtensionObject(&address))
+	{
+		return false;
+	}
+
+	return true;
 }
 
 

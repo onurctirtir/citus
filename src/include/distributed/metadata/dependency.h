@@ -22,6 +22,16 @@
 
 typedef bool (*AddressPredicate)(const ObjectAddress *);
 
+/*
+ * ObjectDependencyEdge is a single directed edge of the object dependency graph:
+ * prereq must be (re)created before dependent.
+ */
+typedef struct ObjectDependencyEdge
+{
+	ObjectAddress prereq;
+	ObjectAddress dependent;
+} ObjectDependencyEdge;
+
 extern List * GetUniqueDependenciesList(List *objectAddressesList);
 extern List * GetDependenciesForObject(const ObjectAddress *target);
 extern List * GetAllSupportedDependenciesForObject(const ObjectAddress *target);
@@ -32,6 +42,9 @@ extern DeferredErrorMessage * DeferErrorIfAnyObjectHasUnsupportedDependency(cons
 extern List * GetAllCitusDependedDependenciesForObject(const ObjectAddress *target);
 extern List * OrderObjectAddressListInDependencyOrder(List *objectAddressList,
 													  bool flushCaches);
+extern List * OrderObjectAddressListInDependencyOrderWithEdges(List *objectAddressList,
+															   bool flushCaches,
+															   List **edgeList);
 extern bool SupportedDependencyByCitus(const ObjectAddress *address);
 extern List * GetPgDependTuplesForDependingObjects(Oid targetObjectClassId,
 												   Oid targetObjectId);
