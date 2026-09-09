@@ -175,7 +175,8 @@ extern void ActivateNodeList(MetadataSyncContext *context);
 
 extern char * WorkerDropAllShellTablesCommand(bool singleTransaction);
 extern char * WorkerDropSequenceDependencyCommand(Oid relationId);
-extern List * ShellTableCreationCommandList(Oid relationId);
+extern List * ShellTableCreationCommandList(Oid relationId, bool bundlePartitionMetadata);
+extern bool ShouldSyncTableMetadataAndNotOwnedByExtension(Oid relationId);
 
 extern void SyncDistributedObjects(MetadataSyncContext *context);
 extern void SendNodeWideObjectsSyncCommands(MetadataSyncContext *context);

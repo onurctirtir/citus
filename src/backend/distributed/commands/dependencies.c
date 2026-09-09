@@ -38,7 +38,8 @@ static void EnsureDependenciesCanBeDistributed(const ObjectAddress *relationAddr
 static void ErrorIfCircularDependencyExists(const ObjectAddress *objectAddress);
 static int ObjectAddressComparator(const void *a, const void *b);
 static void EnsureDependenciesExistOnAllNodes(const ObjectAddress *target);
-static List * GetDependencyCreateDDLCommands(const ObjectAddress *dependency);
+static List * GetDependencyCreateDDLCommands(const ObjectAddress *dependency,
+											 bool bundlePartitionMetadata);
 static bool ShouldPropagateObject(const ObjectAddress *address);
 static char * DropTableIfExistsCommand(Oid relationId);
 
@@ -73,7 +74,9 @@ EnsureDependenciesExistOnAllNodes(const ObjectAddress *target)
 	ObjectAddress *dependency = NULL;
 	foreach_ptr(dependency, dependencies)
 	{
-		List *dependencyCommands = GetDependencyCreateDDLCommands(dependency);
+		bool bundlePartitionMetadata = false;
+		List *dependencyCommands = GetDependencyCreateDDLCommands(dependency,
+																  bundlePartitionMetadata);
 		ddlCommands = list_concat(ddlCommands, dependencyCommands);
 
 		/* create a new list with dependencies that actually created commands */
@@ -328,7 +331,9 @@ GetDistributableDependenciesForObject(const ObjectAddress *target)
 		 * in nodes, but we utilize logic it follows to choose the objects that could
 		 * be distributed
 		 */
-		List *dependencyCommands = GetDependencyCreateDDLCommands(dependency);
+		bool bundlePartitionMetadata = false;
+		List *dependencyCommands = GetDependencyCreateDDLCommands(dependency,
+																  bundlePartitionMetadata);
 
 		/* create a new list with dependencies that actually created commands */
 		if (list_length(dependencyCommands) > 0)
@@ -361,7 +366,8 @@ DropTableIfExistsCommand(Oid relationId)
  * commands to execute on a worker to create the object.
  */
 static List *
-GetDependencyCreateDDLCommands(const ObjectAddress *dependency)
+GetDependencyCreateDDLCommands(const ObjectAddress *dependency,
+							   bool bundlePartitionMetadata)
 {
 	switch (getObjectClass(dependency))
 	{
@@ -398,7 +404,8 @@ GetDependencyCreateDDLCommands(const ObjectAddress *dependency)
 
 				if (IsCitusTable(relationId))
 				{
-					commandList = ShellTableCreationCommandList(relationId);
+					commandList = ShellTableCreationCommandList(relationId,
+																bundlePartitionMetadata);
 				}
 
 				return commandList;
@@ -538,7 +545,7 @@ GetDependencyCreateDDLCommands(const ObjectAddress *dependency)
  * that (re)create the shell table for the given Citus table on a worker node.
  */
 List *
-ShellTableCreationCommandList(Oid relationId)
+ShellTableCreationCommandList(Oid relationId, bool bundlePartitionMetadata)
 {
 	List *commandList = NIL;
 
@@ -564,6 +571,13 @@ ShellTableCreationCommandList(Oid relationId)
 	commandList = lcons(DropTableIfExistsCommand(relationId), commandList);
 	commandList = lcons(WorkerDropSequenceDependencyCommand(relationId), commandList);
 
+	if (bundlePartitionMetadata &&
+		ShouldSyncTableMetadataAndNotOwnedByExtension(relationId))
+	{
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
+		commandList = lappend(commandList, DistributionCreateCommand(cacheEntry));
+	}
+
 	return commandList;
 }
 
@@ -573,14 +587,16 @@ ShellTableCreationCommandList(Oid relationId)
  * for given dependencies.
  */
 List *
-GetAllDependencyCreateDDLCommands(const List *dependencies)
+GetAllDependencyCreateDDLCommands(const List *dependencies, bool bundlePartitionMetadata)
 {
 	List *commands = NIL;
 
 	ObjectAddress *dependency = NULL;
 	foreach_ptr(dependency, dependencies)
 	{
-		commands = list_concat(commands, GetDependencyCreateDDLCommands(dependency));
+		commands = list_concat(commands,
+							   GetDependencyCreateDDLCommands(dependency,
+															  bundlePartitionMetadata));
 	}
 
 	return commands;

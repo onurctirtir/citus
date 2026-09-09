@@ -124,6 +124,8 @@ static void AppendRelationMetadataBatchRows(Oid relationId,
 											StringInfo partitionValues,
 											StringInfo shardValues,
 											StringInfo placementValues);
+static void AppendDistributionMetadataBatchRow(StringInfo partitionValues,
+											   CitusTableCacheEntry *cacheEntry);
 static void AppendShardMetadataBatchRows(StringInfo shardValues,
 										 StringInfo placementValues,
 										 List *shardIntervalList);
@@ -1177,6 +1179,30 @@ DistributionCreateCommand(CitusTableCacheEntry *cacheEntry)
 					 replicationModel);
 
 	return insertDistributionCommand->data;
+}
+
+
+/*
+ * ShouldSyncTableMetadataAndNotOwnedByExtension returns true if the metadata of
+ * a distributed table should be propagated to metadata workers and it's not
+ * owned by an extension.
+ */
+bool
+ShouldSyncTableMetadataAndNotOwnedByExtension(Oid relationId)
+{
+	if (!ShouldSyncTableMetadata(relationId))
+	{
+		return false;
+	}
+
+	ObjectAddress tableAddress = { 0 };
+	ObjectAddressSet(tableAddress, RelationRelationId, relationId);
+	if (IsAnyObjectAddressOwnedByExtension(list_make1(&tableAddress), NULL))
+	{
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -5145,7 +5171,9 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 		if (!IsAnyObjectAddressOwnedByExtension(list_make1(dependency), NULL))
 		{
 			/* dependency creation commands */
-			List *ddlCommands = GetAllDependencyCreateDDLCommands(list_make1(dependency));
+			bool bundlePartitionMetadata = true;
+			List *ddlCommands = GetAllDependencyCreateDDLCommands(list_make1(dependency),
+																  bundlePartitionMetadata);
 			SendOrCollectCommandListToActivatedNodes(context, ddlCommands);
 		}
 
@@ -5338,8 +5366,64 @@ static void
 AppendRelationMetadataBatchRows(Oid relationId, StringInfo partitionValues,
 								StringInfo shardValues, StringInfo placementValues)
 {
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
+
+	/*
+	 * The pg_dist_partition row is bundled with the shell table CREATE for
+	 * tables that get a shell table bundle (see
+	 * ShouldSyncTableMetadataAndNotOwnedByExtension); only emit it here for the
+	 * excluded tables (e.g. extension-owned shell tables) so we neither
+	 * duplicate the row nor leave it out.
+	 */
+	if (!ShouldSyncTableMetadataAndNotOwnedByExtension(relationId))
+	{
+		AppendDistributionMetadataBatchRow(partitionValues, cacheEntry);
+	}
+
 	List *shardIntervalList = LoadShardIntervalList(relationId);
 	AppendShardMetadataBatchRows(shardValues, placementValues, shardIntervalList);
+}
+
+
+/*
+ * AppendDistributionMetadataBatchRow appends one VALUES row describing the
+ * pg_dist_partition entry of cacheEntry's relation to partitionValues.
+ */
+static void
+AppendDistributionMetadataBatchRow(StringInfo partitionValues,
+								   CitusTableCacheEntry *cacheEntry)
+{
+	Oid relationId = cacheEntry->relationId;
+	char distributionMethod = cacheEntry->partitionMethod;
+	char *qualifiedRelationName = generate_qualified_relation_name(relationId);
+	uint32 colocationId = cacheEntry->colocationId;
+	char replicationModel = cacheEntry->replicationModel;
+
+	StringInfo tablePartitionKeyNameString = makeStringInfo();
+	if (!HasDistributionKeyCacheEntry(cacheEntry))
+	{
+		appendStringInfoString(tablePartitionKeyNameString, "NULL");
+	}
+	else
+	{
+		char *partitionKeyColumnName =
+			ColumnToColumnName(relationId, (Node *) cacheEntry->partitionColumn);
+		appendStringInfo(tablePartitionKeyNameString, "%s",
+						 quote_literal_cstr(partitionKeyColumnName));
+	}
+
+	if (partitionValues->len > 0)
+	{
+		appendStringInfoString(partitionValues, ", ");
+	}
+
+	appendStringInfo(partitionValues,
+					 "(%s::regclass, '%c'::\"char\", %s::text, %d, '%c'::\"char\")",
+					 quote_literal_cstr(qualifiedRelationName),
+					 distributionMethod,
+					 tablePartitionKeyNameString->data,
+					 colocationId,
+					 replicationModel);
 }
 
 
