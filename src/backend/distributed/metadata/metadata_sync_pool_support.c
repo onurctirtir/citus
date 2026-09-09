@@ -126,6 +126,8 @@ EdgeGatedOnComplete(MetadataSyncPool *pool, MetadataSyncPoolTask *task)
 	pool->completedTasks++;
 
 	FlushMetadataSyncCachesIfNeeded(pool->context, pool->completedTasks);
+	LogMetadataSyncProgress(pool->objectLabel, pool->completedTasks - 1,
+							pool->completedTasks, pool->totalTasks);
 
 	MetadataSyncPoolTask *successor = NULL;
 	foreach_ptr(successor, task->successors)
@@ -230,6 +232,8 @@ StreamingLeafOnComplete(MetadataSyncPool *pool, MetadataSyncPoolTask *task)
 	pool->completedTasks++;
 
 	FlushMetadataSyncCachesIfNeeded(pool->context, pool->completedTasks);
+	LogMetadataSyncProgress(pool->objectLabel, pool->completedTasks - 1,
+							pool->completedTasks, 0);
 
 	pfree(task);
 }

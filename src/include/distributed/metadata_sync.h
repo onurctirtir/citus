@@ -194,6 +194,8 @@ extern void SendInterTableRelationshipCommands(MetadataSyncContext *context);
  * metadata_sync.c internals shared with the pool task sources that live in
  * metadata_sync_pool_core.c / metadata_sync_pool_support.c.
  */
+extern void LogMetadataSyncProgress(const char *label, int64 previousCount,
+									int64 currentCount, int64 totalCount);
 extern void FlushMetadataSyncCachesIfNeeded(MetadataSyncContext *context,
 											int64 processedCount);
 
