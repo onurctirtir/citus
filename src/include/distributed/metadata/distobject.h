@@ -35,9 +35,11 @@ extern bool IsObjectAddressOwnedByCitus(const ObjectAddress *objectAddress);
 extern ObjectAddress PgGetObjectAddress(char *ttype, ArrayType *namearr,
 										ArrayType *argsarr);
 extern List * GetDistributedObjectAddressList(void);
+extern List * GetDistributedObjectAddressListWithoutShellTablesAndSequences(void);
 extern RoleSpec * GetRoleSpecObjectForUser(Oid roleOid);
 extern void UpdateDistributedObjectColocationId(uint32 oldColocationId, uint32
 												newColocationId);
 extern List * DistributedFunctionList(void);
 extern List * DistributedSequenceList(void);
+extern bool ObjectIsSequence(Oid classId, Oid objId);
 #endif /* CITUS_METADATA_DISTOBJECT_H */

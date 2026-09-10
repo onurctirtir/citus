@@ -20,6 +20,7 @@
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_extension_d.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
@@ -55,6 +56,9 @@ static char * CreatePgDistObjectEntryCommand(const ObjectAddress *objectAddress)
 static int ExecuteCommandAsSuperuser(char *query, int paramCount, Oid *paramTypes,
 									 Datum *paramValues);
 static bool IsObjectDistributed(const ObjectAddress *address);
+static List * GetDistributedObjectAddressListInternal(bool excludeCitusShellTables,
+													  bool excludeDistributedSequences);
+static bool ObjectIsCitusTableViaCitusCatalog(Oid classId, Oid objId);
 
 PG_FUNCTION_INFO_V1(citus_unmark_object_distributed);
 PG_FUNCTION_INFO_V1(master_unmark_object_distributed);
@@ -446,11 +450,46 @@ IsAnyObjectDistributed(const List *addresses)
 
 
 /*
+ * GetDistributedObjectAddressListWithoutShellTablesAndSequences returns the
+ * distributed objects marked in pg_dist_object except the Citus shell tables
+ * and the distributed sequences.
+ */
+List *
+GetDistributedObjectAddressListWithoutShellTablesAndSequences(void)
+{
+	bool excludeCitusShellTables = true;
+	bool excludeDistributedSequences = true;
+	return GetDistributedObjectAddressListInternal(excludeCitusShellTables,
+												   excludeDistributedSequences);
+}
+
+
+/*
  * GetDistributedObjectAddressList returns a list of ObjectAddresses that contains all
  * distributed objects as marked in pg_dist_object
  */
 List *
 GetDistributedObjectAddressList(void)
+{
+	bool excludeCitusShellTables = false;
+	bool excludeDistributedSequences = false;
+	return GetDistributedObjectAddressListInternal(excludeCitusShellTables,
+												   excludeDistributedSequences);
+}
+
+
+/*
+ * GetDistributedObjectAddressListInternal is the shared implementation behind
+ * GetDistributedObjectAddressList() and its shell-table / sequence excluding
+ * variants. It scans pg_dist_object and returns an ObjectAddress list of the
+ * distributed objects, optionally skipping Citus shell tables and/or
+ * distributed sequences during the scan. Note that; to skip the desired object
+ * kinds, it scans relevant catalog to determine, so be cautious when asking for
+ * exclusions in hot code-paths.
+ */
+static List *
+GetDistributedObjectAddressListInternal(bool excludeCitusShellTables,
+										bool excludeDistributedSequences)
 {
 	HeapTuple pgDistObjectTup = NULL;
 	List *objectAddressList = NIL;
@@ -463,6 +502,20 @@ GetDistributedObjectAddressList(void)
 	{
 		Form_pg_dist_object pg_dist_object =
 			(Form_pg_dist_object) GETSTRUCT(pgDistObjectTup);
+
+		if (excludeCitusShellTables &&
+			ObjectIsCitusTableViaCitusCatalog(pg_dist_object->classid,
+											  pg_dist_object->objid))
+		{
+			continue;
+		}
+
+		if (excludeDistributedSequences &&
+			ObjectIsSequence(pg_dist_object->classid, pg_dist_object->objid))
+		{
+			continue;
+		}
+
 		ObjectAddress *objectAddress = palloc0(sizeof(ObjectAddress));
 		ObjectAddressSubSet(*objectAddress,
 							pg_dist_object->classid,
@@ -475,6 +528,31 @@ GetDistributedObjectAddressList(void)
 	relation_close(pgDistObjectRel, AccessShareLock);
 
 	return objectAddressList;
+}
+
+
+/*
+ * ObjectIsCitusTableViaCitusCatalog returns whether the object identified by
+ * (classId, objId) refers to a Citus table.
+ *
+ * This doesn't access Citus caches.
+ */
+static bool
+ObjectIsCitusTableViaCitusCatalog(Oid classId, Oid objId)
+{
+	if (classId != RelationRelationId)
+	{
+		return false;
+	}
+
+	char relKind = get_rel_relkind(objId);
+	if (relKind != RELKIND_RELATION && relKind != RELKIND_PARTITIONED_TABLE &&
+		relKind != RELKIND_FOREIGN_TABLE)
+	{
+		return false;
+	}
+
+	return IsCitusTableViaCatalog(objId);
 }
 
 
@@ -622,4 +700,20 @@ DistributedSequenceList(void)
 	systable_endscan(pgDistObjectScan);
 	relation_close(pgDistObjectRel, AccessShareLock);
 	return distributedSequenceList;
+}
+
+
+/*
+ * ObjectIsSequence returns whether the object identified by
+ * (classId, objId) refers to a sequence.
+ */
+bool
+ObjectIsSequence(Oid classId, Oid objId)
+{
+	if (classId != RelationRelationId)
+	{
+		return false;
+	}
+
+	return get_rel_relkind(objId) == RELKIND_SEQUENCE;
 }

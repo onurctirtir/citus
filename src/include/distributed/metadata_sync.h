@@ -33,6 +33,7 @@ extern int MetadataSyncTransMode;
 extern int MetadataSyncCacheFlushInterval;
 extern int MetadataSyncSetBatchSize;
 extern bool MetadataSyncReleaseDeparseLocks;
+extern bool MetadataSyncUsePool;
 
 /*
  * MetadataSyncContext is used throughout metadata sync.
@@ -188,6 +189,13 @@ extern void SendDependencyCreationCommands(MetadataSyncContext *context);
 extern void SendDistTableMetadataCommands(MetadataSyncContext *context);
 extern void SendDistObjectCommands(MetadataSyncContext *context);
 extern void SendInterTableRelationshipCommands(MetadataSyncContext *context);
+
+/*
+ * metadata_sync.c internals shared with the pool task sources that live in
+ * metadata_sync_pool_core.c / metadata_sync_pool_support.c.
+ */
+extern void FlushMetadataSyncCachesIfNeeded(MetadataSyncContext *context,
+											int64 processedCount);
 
 #define DELETE_ALL_NODES "DELETE FROM pg_dist_node"
 #define DELETE_ALL_PLACEMENTS "DELETE FROM pg_dist_placement"
