@@ -36,6 +36,7 @@
 #include "commands/extension.h"
 #include "common/hashfn.h"
 #include "executor/tuptable.h"
+#include "mb/pg_wchar.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -142,7 +143,52 @@ typedef struct ObjectAddressCollector
 	 */
 	Tuplestorestate *edgeStore;
 	TupleDesc edgeStoreTupleDesc;
+
+	/*
+	 * arrayNameCollisions/collisionEdgeStore mitigate the NAMEDATALEN
+	 * array-type-name collision race described at
+	 * RecordArrayTypeNameCollisionEdgeIfNeeded(): two sibling shell tables
+	 * whose names agree on their first NAMEDATALEN-2 bytes generate the
+	 * identical PostgreSQL auto-array-type name, so creating them on two
+	 * different pool connections concurrently can race on that array type's
+	 * pg_type row. Both fields are opt-in, tuplestore-mode-only (NULL
+	 * whenever dependencyStore is NULL), and scoped to shell tables only
+	 * (see ObjectAddressIsShellTableArrayTypeCandidate()): every other object
+	 * kind is unaffected by this tracking. arrayNameCollisions is a scratch
+	 * HTAB, live only for the duration of the traversal (destroyed
+	 * alongside addressInfo); collisionEdgeStore holds already-resolved
+	 * dense (prereqTaskId, dependentTaskId) pairs -- same shape as the
+	 * resolved edgeStore output -- and is merged into *edgeStore once the
+	 * traversal finishes.
+	 */
+	HTAB *arrayNameCollisions;
+	Tuplestorestate *collisionEdgeStore;
+	TupleDesc collisionEdgeTupleDesc;
 } ObjectAddressCollector;
+
+/*
+ * ArrayTypeNameCollisionKey is the key of ObjectAddressCollector's
+ * arrayNameCollisions HTAB: the (schema, truncated-array-type-name) pair that
+ * two distinct shell tables can collide on. See
+ * RecordArrayTypeNameCollisionEdgeIfNeeded().
+ */
+typedef struct ArrayTypeNameCollisionKey
+{
+	Oid namespaceOid;
+	char candidateArrayTypeName[NAMEDATALEN];
+} ArrayTypeNameCollisionKey;
+
+/*
+ * ArrayTypeNameCollisionEntry tracks, for a given ArrayTypeNameCollisionKey,
+ * the dense task id of the most recently collected shell table that would
+ * generate that array type name. See
+ * RecordArrayTypeNameCollisionEdgeIfNeeded().
+ */
+typedef struct ArrayTypeNameCollisionEntry
+{
+	ArrayTypeNameCollisionKey key;
+	int32 lastTaskId;
+} ArrayTypeNameCollisionEntry;
 
 /*
  * DependencyMode distinguishes the data stored in DependencyDefinition. For details see
@@ -237,6 +283,14 @@ static List * OrderObjectAddressListInDependencyOrderInternal(List *objectAddres
 															  bool flushCaches,
 															  bool recordEdges,
 															  List **edgeList);
+static void RecordArrayTypeNameCollisionEdgeIfNeeded(ObjectAddressCollector *collector,
+													 const ObjectAddress *collected,
+													 int32 taskId);
+static bool ObjectAddressIsShellTableArrayTypeCandidate(const ObjectAddress *address,
+														Oid *namespaceOid,
+														char **relationName);
+static void ComputeShellTableArrayTypeCandidateName(const char *relationName,
+													char *candidateNameOut);
 
 typedef List *(*expandFn)(ObjectAddressCollector *collector, ObjectAddress target);
 typedef bool (*followFn)(ObjectAddressCollector *collector,
@@ -877,16 +931,16 @@ ResolveObjectDependencyEdgesToTaskIds(ObjectAddressCollector *collector)
  */
 void
 OrderObjectAddressTuplestoreInDependencyOrderWithEdges(Tuplestorestate *
-														objectAddressStore,
-														TupleDesc
-														objectAddressTupleDesc,
-														bool flushCaches,
-														Tuplestorestate **
-														orderedAddressStore,
-														TupleDesc *
-														orderedAddressTupleDesc,
-														Tuplestorestate **edgeStore,
-														TupleDesc *edgeTupleDesc)
+													   objectAddressStore,
+													   TupleDesc
+													   objectAddressTupleDesc,
+													   bool flushCaches,
+													   Tuplestorestate **
+													   orderedAddressStore,
+													   TupleDesc *
+													   orderedAddressTupleDesc,
+													   Tuplestorestate **edgeStore,
+													   TupleDesc *edgeTupleDesc)
 {
 	ObjectAddressCollector collector = { 0 };
 	InitObjectAddressCollector(&collector);
@@ -897,6 +951,21 @@ OrderObjectAddressTuplestoreInDependencyOrderWithEdges(Tuplestorestate *
 
 	collector.edgeStoreTupleDesc = CreateObjectDependencyEdgeTupleDesc();
 	collector.edgeStore = tuplestore_begin_heap(false, false, work_mem);
+
+	/*
+	 * See the ObjectAddressCollector.arrayNameCollisions/collisionEdgeStore
+	 * comment and RecordArrayTypeNameCollisionEdgeIfNeeded() for what these
+	 * track. Both are scratch state, live only for the duration of this
+	 * traversal.
+	 */
+	assert_valid_hash_key2(ArrayTypeNameCollisionKey, namespaceOid,
+						   candidateArrayTypeName);
+	collector.arrayNameCollisions =
+		CreateSimpleHashWithName(ArrayTypeNameCollisionKey,
+								 ArrayTypeNameCollisionEntry,
+								 "array type name collision info");
+	collector.collisionEdgeTupleDesc = CreateObjectDependencyEdgeIdTupleDesc();
+	collector.collisionEdgeStore = tuplestore_begin_heap(false, false, work_mem);
 
 	TupleTableSlot *inputSlot = CreateObjectAddressTupleSlot(objectAddressTupleDesc);
 
@@ -951,6 +1020,33 @@ OrderObjectAddressTuplestoreInDependencyOrderWithEdges(Tuplestorestate *
 	 */
 	*edgeStore = ResolveObjectDependencyEdgesToTaskIds(&collector);
 	*edgeTupleDesc = collector.edgeStoreTupleDesc;
+
+	/*
+	 * Merge the array-type-name collision edges (already resolved to dense
+	 * id pairs by RecordArrayTypeNameCollisionEdgeIfNeeded()) into the
+	 * just-resolved *edgeStore. Nothing has read *edgeStore yet, so a simple
+	 * rescan-and-append is enough; no re-resolution is needed since these
+	 * edges were already stored as dense ids, not raw ObjectAddresses.
+	 */
+	TupleTableSlot *collisionEdgeSlot =
+		CreateObjectDependencyEdgeIdTupleSlot(collector.collisionEdgeTupleDesc);
+
+	tuplestore_rescan(collector.collisionEdgeStore);
+
+	int32 prereqTaskId;
+	int32 dependentTaskId;
+	while (GetNextObjectDependencyEdgeIdsFromTuplestore(collector.collisionEdgeStore,
+														collisionEdgeSlot,
+														&prereqTaskId,
+														&dependentTaskId))
+	{
+		PutObjectDependencyEdgeIdsToTuplestore(*edgeStore, *edgeTupleDesc,
+											   prereqTaskId, dependentTaskId);
+	}
+
+	ExecDropSingleTupleTableSlot(collisionEdgeSlot);
+	tuplestore_end(collector.collisionEdgeStore);
+	hash_destroy(collector.arrayNameCollisions);
 
 	hash_destroy(collector.addressInfo);
 }
@@ -1190,6 +1286,10 @@ InitObjectAddressCollector(ObjectAddressCollector *collector)
 	collector->dependencyStoreTupleDesc = NULL;
 	collector->edgeStore = NULL;
 	collector->edgeStoreTupleDesc = NULL;
+
+	collector->arrayNameCollisions = NULL;
+	collector->collisionEdgeStore = NULL;
+	collector->collisionEdgeTupleDesc = NULL;
 }
 
 
@@ -1339,6 +1439,7 @@ CollectObjectAddress(ObjectAddressCollector *collector, const ObjectAddress *col
 	if (collector->dependencyStore != NULL)
 	{
 		entry->id = collector->nextTaskId++;
+		RecordArrayTypeNameCollisionEdgeIfNeeded(collector, &entry->key, entry->id);
 		PutObjectAddressToTuplestore(collector->dependencyStore,
 									 collector->dependencyStoreTupleDesc, &entry->key);
 		return;
@@ -1346,6 +1447,175 @@ CollectObjectAddress(ObjectAddressCollector *collector, const ObjectAddress *col
 
 	/* add to list*/
 	collector->dependencyList = lappend(collector->dependencyList, &entry->key);
+}
+
+
+/*
+ * RecordArrayTypeNameCollisionEdgeIfNeeded mitigates a live race in parallel
+ * shell-table creation: PostgreSQL auto-generates each table's array type
+ * name by truncating the table name to NAMEDATALEN-2 bytes and prepending an
+ * underscore (see makeArrayTypeName()/makeObjectName() in
+ * src/backend/catalog/pg_type.c). Two sibling shell tables whose names agree
+ * on that truncated prefix (differing only after byte NAMEDATALEN-2)
+ * therefore produce the SAME candidate array type name. When the metadata
+ * sync pool creates both tables concurrently on two different connections
+ * (two different sessions/transactions), each session's own "does this
+ * array type already exist" check only sees its own transaction's view, so
+ * both sessions independently conclude "no conflict" and both attempt to
+ * create the identical pg_type row -- one commits, the other fails on
+ * pg_type_typname_nsp_index.
+ *
+ * We do not call the real makeArrayTypeName() here: it consults the
+ * coordinator's own already-resolved pg_type syscache, which reflects state
+ * that is irrelevant to what two fresh, empty worker sessions would
+ * independently compute. Instead ComputeShellTableArrayTypeCandidateName()
+ * replicates only the deterministic, syscache-free part of that algorithm
+ * (PostgreSQL's "pass=0" candidate), which is exactly the value that can
+ * race.
+ *
+ * Scope is intentionally narrow: only objects that
+ * ObjectAddressIsShellTableArrayTypeCandidate() identifies as citus shell
+ * tables are tracked (not sequences, views, or any other object kind), to
+ * keep this the smallest, safest change that addresses the observed live
+ * failure.
+ *
+ * Whenever a second (or later) shell table hashes to the same
+ * (namespace, candidate array type name) key as a previously collected one,
+ * a dependency edge from the previous task to this one is recorded in
+ * collector->collisionEdgeStore, forcing the pool to serialize the pair (and
+ * transitively, the whole colliding group, since each new collision chains
+ * onto the last-seen task) instead of letting them run on concurrent
+ * connections. This reuses the exact same dense-task-id CSR edge machinery
+ * already built for real dependency ordering; see
+ * OrderObjectAddressTuplestoreInDependencyOrderWithEdges(), which merges
+ * collisionEdgeStore into the resolved edge output before returning it.
+ *
+ * No-ops entirely when arrayNameCollisions is NULL, which is the case for
+ * every List-based/serial caller of the collector -- this tracking only
+ * applies to the tuplestore-based, pool-parallel entry point.
+ */
+static void
+RecordArrayTypeNameCollisionEdgeIfNeeded(ObjectAddressCollector *collector,
+										 const ObjectAddress *collected, int32 taskId)
+{
+	if (collector->arrayNameCollisions == NULL)
+	{
+		return;
+	}
+
+	Oid namespaceOid = InvalidOid;
+	char *relationName = NULL;
+
+	if (!ObjectAddressIsShellTableArrayTypeCandidate(collected, &namespaceOid,
+													 &relationName))
+	{
+		return;
+	}
+
+	ArrayTypeNameCollisionKey key;
+	memset(&key, 0, sizeof(ArrayTypeNameCollisionKey));
+	key.namespaceOid = namespaceOid;
+	ComputeShellTableArrayTypeCandidateName(relationName, key.candidateArrayTypeName);
+
+	bool found = false;
+	ArrayTypeNameCollisionEntry *collisionEntry =
+		(ArrayTypeNameCollisionEntry *) hash_search(collector->arrayNameCollisions,
+													&key, HASH_ENTER, &found);
+
+	if (found)
+	{
+		/*
+		 * Another shell table already collected in this traversal would
+		 * generate the same array type name. Force it to run before this
+		 * one by recording a resolved (prereqTaskId, dependentTaskId) edge
+		 * directly -- both ids are already dense task ids at this point, so
+		 * no address-to-id resolution step is needed, unlike the raw
+		 * ObjectAddress edges recorded by RecordDependencyEdge().
+		 */
+		PutObjectDependencyEdgeIdsToTuplestore(collector->collisionEdgeStore,
+											   collector->collisionEdgeTupleDesc,
+											   collisionEntry->lastTaskId, taskId);
+	}
+
+	collisionEntry->key = key;
+	collisionEntry->lastTaskId = taskId;
+}
+
+
+/*
+ * ObjectAddressIsShellTableArrayTypeCandidate returns whether address is a
+ * citus shell table whose creation would make PostgreSQL auto-generate an
+ * array type name (i.e. a plain/partitioned/foreign table backing a citus
+ * table). This mirrors GetDependencyCreateDDLCommands()'s OCLASS_CLASS
+ * gating in commands/dependencies.c exactly, because that is the code path
+ * that actually triggers ShellTableCreationCommandList() and therefore the
+ * array-type auto-generation this function is guarding against.
+ *
+ * On success, *namespaceOid and *relationName are set to the table's schema
+ * and (unqualified, non-quoted) name, which is exactly the input
+ * ComputeShellTableArrayTypeCandidateName() needs.
+ */
+static bool
+ObjectAddressIsShellTableArrayTypeCandidate(const ObjectAddress *address,
+											Oid *namespaceOid, char **relationName)
+{
+	if (getObjectClass(address) != OCLASS_CLASS)
+	{
+		return false;
+	}
+
+	char relKind = get_rel_relkind(address->objectId);
+
+	if (relKind != RELKIND_RELATION &&
+		relKind != RELKIND_PARTITIONED_TABLE &&
+		relKind != RELKIND_FOREIGN_TABLE)
+	{
+		return false;
+	}
+
+	if (!IsCitusTable(address->objectId))
+	{
+		return false;
+	}
+
+	*namespaceOid = get_rel_namespace(address->objectId);
+	*relationName = get_rel_name(address->objectId);
+
+	return true;
+}
+
+
+/*
+ * ComputeShellTableArrayTypeCandidateName replicates the deterministic,
+ * syscache-free part of PostgreSQL's makeArrayTypeName()/makeObjectName()
+ * (src/backend/catalog/pg_type.c): the "pass=0" candidate array type name
+ * that a CREATE TABLE for relationName would compute before probing
+ * pg_type for a conflict. This is intentionally the ONLY part we replicate;
+ * see RecordArrayTypeNameCollisionEdgeIfNeeded()'s comment for why we must
+ * not call the real makeArrayTypeName() here.
+ *
+ * candidateNameOut must point to a buffer of at least NAMEDATALEN bytes and
+ * is filled with a NUL-terminated "_" + truncated-relationName string,
+ * truncated multibyte-safely via pg_mbcliplen exactly like the original.
+ */
+static void
+ComputeShellTableArrayTypeCandidateName(const char *relationName, char *candidateNameOut)
+{
+	/* "_" separator overhead, matching makeObjectName("", relationName, NULL) */
+	int overhead = 1;
+	int availChars = NAMEDATALEN - 1 - overhead;
+	int nameChars = strlen(relationName);
+
+	if (nameChars > availChars)
+	{
+		nameChars = availChars;
+	}
+
+	nameChars = pg_mbcliplen(relationName, nameChars, nameChars);
+
+	candidateNameOut[0] = '_';
+	memcpy(candidateNameOut + 1, relationName, nameChars);
+	candidateNameOut[nameChars + 1] = '\0';
 }
 
 
