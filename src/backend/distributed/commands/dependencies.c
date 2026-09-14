@@ -793,3 +793,53 @@ FilterObjectAddressListByPredicate(List *objectAddressList, AddressPredicate pre
 
 	return result;
 }
+
+
+/*
+ * FilterObjectAddressTuplestoreByPredicate is the tuplestore-backed counterpart of
+ * FilterObjectAddressListByPredicate() above: it reads objectAddressStore forward
+ * exactly once and writes only the rows for which predicate returns true into a
+ * new tuplestore, so a very large distributed object set is never fully
+ * materialized as an in-memory List at this filtering step either.
+ *
+ * objectAddressStore is rewound (tuplestore_rescan) before being read, and the
+ * caller retains ownership of it. The returned tuplestore is allocated in the
+ * current memory context and owned by the caller.
+ */
+void
+FilterObjectAddressTuplestoreByPredicate(Tuplestorestate *objectAddressStore,
+										 TupleDesc objectAddressTupleDesc,
+										 AddressPredicate predicate,
+										 bool flushCaches,
+										 Tuplestorestate **filteredStore,
+										 TupleDesc *filteredTupleDesc)
+{
+	TupleDesc resultTupleDesc = CreateObjectAddressTupleDesc();
+	Tuplestorestate *resultStore = tuplestore_begin_heap(false, false, work_mem);
+
+	TupleTableSlot *inputSlot = CreateObjectAddressTupleSlot(objectAddressTupleDesc);
+
+	tuplestore_rescan(objectAddressStore);
+
+	ObjectAddress objectAddress;
+	int64 processedCount = 0;
+	while (GetNextObjectAddressFromTuplestore(objectAddressStore, inputSlot,
+											  &objectAddress))
+	{
+		if (predicate(&objectAddress))
+		{
+			PutObjectAddressToTuplestore(resultStore, resultTupleDesc, &objectAddress);
+		}
+
+		/* see the matching comment in FilterObjectAddressListByPredicate */
+		if (flushCaches && MetadataSyncCacheFlushIntervalReached(++processedCount))
+		{
+			FlushCachesForMetadataSync();
+		}
+	}
+
+	ExecDropSingleTupleTableSlot(inputSlot);
+
+	*filteredStore = resultStore;
+	*filteredTupleDesc = resultTupleDesc;
+}

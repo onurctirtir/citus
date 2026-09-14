@@ -38,13 +38,6 @@ typedef struct MetadataSyncPoolConnection
 	MetadataSyncPoolTask *inFlightTask;
 } MetadataSyncPoolConnection;
 
-/* HTAB entry mapping an ObjectAddress to its task (HASH_BLOBS over ObjectAddress) */
-typedef struct MetadataSyncPoolTaskEntry
-{
-	ObjectAddress key;
-	MetadataSyncPoolTask *task;
-} MetadataSyncPoolTaskEntry;
-
 /* static helpers */
 static void DispatchReadyPoolTasks(MetadataSyncPool *pool);
 static void WaitForAnyReadyPoolConnection(MetadataSyncPool *pool);
@@ -156,53 +149,60 @@ OpenStreamingLeafSource(MetadataSyncPool *pool, Oid scanRelationId,
 
 
 /*
- * MetadataSyncPoolRegisterTasks creates one MetadataSyncPoolTask per
- * distinct object address in taskAddresses and registers it in the pool's
- * address -> task hash. All tasks start with in-degree 0; edges are layered on
- * afterwards by MetadataSyncPoolApplyEdges.
+ * MetadataSyncPoolRegisterTasks creates one MetadataSyncPoolTask per row of
+ * taskAddressStore (produced by OrderObjectAddressTuplestoreInDependencyOrderWithEdges(),
+ * which already excludes extension-owned objects -- see that function's
+ * comment) and stores it at pool->taskById[id], where id is simply the row's
+ * 0-based forward-read position: OrderObjectAddressTuplestoreInDependencyOrderWithEdges()
+ * hands out ids in that same order, so no ObjectAddress -> id lookup is needed
+ * here at all. All tasks start with in-degree 0; edges are layered on
+ * afterwards by MetadataSyncPoolApplyEdges, which is what actually raises
+ * in-degrees for tasks that have a prerequisite.
+ *
+ * taskAddressStore is rewound (tuplestore_rescan) before being read, so the
+ * caller does not need to reset the read cursor itself; the caller retains
+ * ownership of the tuplestore and may reuse it for the next worker node.
  */
 void
 MetadataSyncPoolRegisterTasks(MetadataSyncPool *pool,
-							  List *taskAddresses)
+							  Tuplestorestate *taskAddressStore,
+							  TupleDesc taskAddressTupleDesc)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(pool->poolContext);
 
-	if (pool->taskByAddress == NULL)
-	{
-		HASHCTL info;
-		memset(&info, 0, sizeof(info));
-		info.keysize = sizeof(ObjectAddress);
-		info.entrysize = sizeof(MetadataSyncPoolTaskEntry);
-		info.hcxt = pool->poolContext;
-		int hashFlags = (HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-		pool->taskByAddress = hash_create("metadata sync pool tasks",
-										  32, &info, hashFlags);
-	}
+	int64 totalTasks = tuplestore_tuple_count(taskAddressStore);
+	pool->taskById = palloc0(totalTasks * sizeof(MetadataSyncPoolTask *));
+	pool->readyQueue = palloc(totalTasks * sizeof(int32));
+	pool->readyHead = 0;
+	pool->readyTail = 0;
 
-	ObjectAddress *address = NULL;
-	foreach_ptr(address, taskAddresses)
-	{
-		bool found = false;
-		MetadataSyncPoolTaskEntry *entry =
-			hash_search(pool->taskByAddress, address, HASH_ENTER, &found);
-		if (found)
-		{
-			/* duplicate address in the ordered list; one task is enough */
-			continue;
-		}
+	TupleTableSlot *slot = CreateObjectAddressTupleSlot(taskAddressTupleDesc);
 
+	tuplestore_rescan(taskAddressStore);
+
+	ObjectAddress address;
+	int64 processedCount = 0;
+	int32 nextId = 0;
+	while (GetNextObjectAddressFromTuplestore(taskAddressStore, slot, &address))
+	{
 		MetadataSyncPoolTask *task = palloc0(sizeof(MetadataSyncPoolTask));
-		task->objectAddress = *address;
+		task->objectAddress = address;
 		task->inDegree = 0;
-		task->successors = NIL;
+		task->successorStart = 0;
+		task->successorCount = 0;
 		task->dispatched = false;
 		task->done = false;
 
-		entry->task = task;
-		pool->taskList = lappend(pool->taskList, task);
+		pool->taskById[nextId++] = task;
+
+		FlushMetadataSyncCachesIfNeeded(pool->context, ++processedCount);
 	}
 
-	pool->totalTasks = list_length(pool->taskList);
+	Assert(nextId == totalTasks);
+
+	ExecDropSingleTupleTableSlot(slot);
+
+	pool->totalTasks = totalTasks;
 	pool->remainingTasks = pool->totalTasks;
 
 	MemoryContextSwitchTo(oldContext);
@@ -210,90 +210,87 @@ MetadataSyncPoolRegisterTasks(MetadataSyncPool *pool,
 
 
 /*
- * MetadataSyncPoolApplyEdges layers the dependency edges onto the registered tasks:
- * for every prereq -> dependent edge it appends the dependent to the prerequisite's
- * successor list and increments the dependent's in-degree, but only after resolving
- * BOTH endpoints to the task that actually creates them.
+ * MetadataSyncPoolApplyEdges layers the pre-resolved dependency edges read from
+ * edgeStore onto the registered tasks: edgeStore's rows are (prereqTaskId,
+ * dependentTaskId) int32 pairs, already resolved to dense task ids (both
+ * extension-collapse and self-edge dropping already applied) by
+ * OrderObjectAddressTuplestoreInDependencyOrderWithEdges() -- see that
+ * function's comment -- so this function does no ObjectAddress lookups at all;
+ * it only builds the CSR (compressed sparse row) successor array from the id
+ * pairs, in two passes over edgeStore:
  *
- * An address that is itself a task resolves to that task. An address that is not a
- * task but is owned by an extension resolves to the OWNING EXTENSION's task, because
- * extension-owned objects are created as a side effect of CREATE EXTENSION rather than
- * as their own pool task -- so the real creation-order constraint runs through the
- * extension. Resolving both endpoints matters in two ways:
+ *   Pass 1 counts each prereq task's outgoing edges into its own
+ *   successorStart field (temporarily holding a raw count, not yet an offset)
+ *   and each dependent task's in-degree. A prefix-sum turns those raw counts
+ *   into true CSR start offsets in successorStart, and pool->successorIds is
+ *   allocated to the resulting total edge count.
  *
- *   - a prerequisite reached only THROUGH an extension-owned intermediary (a
- *     distributed function whose signature uses an extension-owned type) collapses the
- *     edge onto that extension, so the dependent waits for CREATE EXTENSION; and
- *   - an edge whose DEPENDENT is extension-owned (an object the extension itself
- *     creates that depends on another scheduled object) collapses onto the extension,
- *     so CREATE EXTENSION still runs after that prerequisite.
+ *   Pass 2 walks edgeStore again, and for each pair writes dependentTaskId into
+ *   pool->successorIds at prereqTask->successorStart + prereqTask->successorCount,
+ *   then increments prereqTask->successorCount -- reusing successorCount both as
+ *   a fill cursor during this pass and, once the pass completes, as the task's
+ *   final successor count (the two coincide because every task's successors are
+ *   filled contiguously starting from its own successorStart).
  *
- * An endpoint that resolves to neither a task nor an extension task is created out of
- * band before this phase and its edge is dropped, exactly as the serial path assumes.
- * Self-edges, including ones that become self-edges after the extension collapse, are
- * ignored so a task can never block on itself.
+ * This two-pass shape means the CSR array is built with no extra O(edge count)
+ * scratch array and no hash table at all.
+ *
+ * edgeStore is rewound (tuplestore_rescan) before each pass; the caller retains
+ * ownership of it and may reuse it for the next worker node.
  */
 void
-MetadataSyncPoolApplyEdges(MetadataSyncPool *pool, List *edgeList)
+MetadataSyncPoolApplyEdges(MetadataSyncPool *pool, Tuplestorestate *edgeStore,
+						  TupleDesc edgeTupleDesc)
 {
-	ObjectDependencyEdge *edge = NULL;
-	foreach_ptr(edge, edgeList)
+	MemoryContext oldContext = MemoryContextSwitchTo(pool->poolContext);
+
+	TupleTableSlot *slot = CreateObjectDependencyEdgeIdTupleSlot(edgeTupleDesc);
+
+	/* pass 1: raw successor counts (in successorStart) and in-degrees */
+	tuplestore_rescan(edgeStore);
+
+	int32 prereqTaskId;
+	int32 dependentTaskId;
+	int64 totalEdges = 0;
+	while (GetNextObjectDependencyEdgeIdsFromTuplestore(edgeStore, slot,
+														&prereqTaskId,
+														&dependentTaskId))
 	{
-		if (memcmp(&edge->prereq, &edge->dependent, sizeof(ObjectAddress)) == 0)
-		{
-			/* self-edge, ignore */
-			continue;
-		}
-
-		/*
-		 * Resolve each endpoint to a scheduled task, following an extension-owned
-		 * object to its owning extension task (see the function comment).
-		 */
-		MetadataSyncPoolTask *endpointTask[2] = { NULL, NULL };
-		ObjectAddress *endpointAddress[2] = { &edge->prereq, &edge->dependent };
-		for (int endpoint = 0; endpoint < 2; endpoint++)
-		{
-			ObjectAddress *address = endpointAddress[endpoint];
-
-			bool found = false;
-			MetadataSyncPoolTaskEntry *entry =
-				hash_search(pool->taskByAddress, address, HASH_FIND, &found);
-			if (!found)
-			{
-				ObjectAddress extensionAddress = { 0 };
-				if (IsAnyObjectAddressOwnedByExtension(list_make1(address),
-													   &extensionAddress))
-				{
-					entry = hash_search(pool->taskByAddress, &extensionAddress,
-										HASH_FIND, &found);
-				}
-			}
-
-			endpointTask[endpoint] = found ? entry->task : NULL;
-		}
-
-		MetadataSyncPoolTask *prereqTask = endpointTask[0];
-		MetadataSyncPoolTask *dependentTask = endpointTask[1];
-
-		if (prereqTask == NULL || dependentTask == NULL)
-		{
-			/* an endpoint is created out of band; drop the edge */
-			continue;
-		}
-
-		if (prereqTask == dependentTask)
-		{
-			/* both endpoints resolve to the same task (e.g. after the extension
-			 * collapse); ignore this self-edge */
-			continue;
-		}
-
-		MemoryContext oldContext = MemoryContextSwitchTo(pool->poolContext);
-		prereqTask->successors = lappend(prereqTask->successors, dependentTask);
-		MemoryContextSwitchTo(oldContext);
-
-		dependentTask->inDegree++;
+		pool->taskById[prereqTaskId]->successorStart++;
+		pool->taskById[dependentTaskId]->inDegree++;
+		totalEdges++;
 	}
+
+	/* prefix sum: convert raw per-task counts into CSR start offsets */
+	int32 offset = 0;
+	for (int64 taskId = 0; taskId < pool->totalTasks; taskId++)
+	{
+		MetadataSyncPoolTask *task = pool->taskById[taskId];
+		int32 rawCount = task->successorStart;
+		task->successorStart = offset;
+		task->successorCount = 0;
+		offset += rawCount;
+	}
+	Assert(offset == totalEdges);
+
+	pool->successorIds = palloc(totalEdges * sizeof(int32));
+
+	/* pass 2: fill pool->successorIds, using successorCount as a fill cursor */
+	tuplestore_rescan(edgeStore);
+
+	while (GetNextObjectDependencyEdgeIdsFromTuplestore(edgeStore, slot,
+														&prereqTaskId,
+														&dependentTaskId))
+	{
+		MetadataSyncPoolTask *prereqTask = pool->taskById[prereqTaskId];
+		int32 slotIndex = prereqTask->successorStart + prereqTask->successorCount;
+		pool->successorIds[slotIndex] = dependentTaskId;
+		prereqTask->successorCount++;
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+
+	MemoryContextSwitchTo(oldContext);
 }
 
 

@@ -15,26 +15,26 @@
  * The dispatch -> wait -> reap connection core in metadata_sync_pool_core.c is source
  * agnostic: it never touches a ready queue, a scan cursor, or a dependency edge
  * directly. All source-specific behavior is provided through a
- * MetadataSyncTaskSourceOps vtable set on the pool. Two sources are implemented in
- * metadata_sync_pool_core.c:
+ * MetadataSyncTaskSourceOps vtable set on the pool. metadata_sync_pool_core.c
+ * implements one source:
  *
  *   edge-gated source (dependency-creation phase)
  *       Tasks are materialized up front from a dependency-ordered ObjectAddress
- *       list plus an edge set. The ready queue is seeded with the in-degree-0
- *       tasks and drained with in-degree gating: completing a task advances its
- *       successors. Used for the small tangled prerequisite DAG (roles, schemas,
- *       types, functions, ...).
+ *       tuplestore plus an edge tuplestore. The ready queue is seeded with the
+ *       in-degree-0 tasks and drained with in-degree gating: completing a task
+ *       advances its successors. Every distributed object -- tables, sequences,
+ *       shell tables, views, publications, and anything else pg_dist_object
+ *       tracks -- is scanned and ordered uniformly and flows through this single
+ *       source; there is no special-cased leaf phase for any object kind, since
+ *       an object with no dependency edges is simply an in-degree-0 task like any
+ *       other.
  *
- *   streaming-leaf source (shell-table and sequence phases)
- *       Tasks are produced on demand by scanning a catalog relation
- *       (pg_dist_partition for shell tables, pg_dist_object for sequences). The
- *       scanned classes are leaves with no intra-class edges, so there is no HTAB,
- *       no edge set, and no successor bookkeeping: at most one task per connection
- *       is ever live, each object's identity is read straight from the scan
- *       cursor, its DDL is deparsed on dispatch and freed on reap. This is how the
- *       numerous classes (up to ~10M shell tables) stay within a bounded memory
- *       budget -- only object OIDs are ever touched, never a materialized list of
- *       them or of their command strings.
+ * A separate streaming-leaf source (MetadataSyncTaskSourceOps StreamingLeafSourceOps,
+ * driven via OpenStreamingLeafSource()) also exists in metadata_sync_pool_core.c: it
+ * produces tasks on demand by scanning a catalog relation, without any HTAB, edge
+ * set, or successor bookkeeping. Metadata sync's dependency-creation phase does not
+ * use it; it is kept for other pool-driven phases (e.g. shelldrop's drop path) that
+ * still want a bounded-memory leaf scan.
  *
  * Copyright (c) Citus Data, Inc.
  *
@@ -50,22 +50,25 @@
 #include "access/htup.h"
 #include "access/tupdesc.h"
 #include "catalog/objectaddress.h"
-#include "utils/hsearch.h"
 #include "utils/relcache.h"
+#include "utils/tuplestore.h"
 
 #include "distributed/metadata_sync.h"
 
 /*
  * MetadataSyncPoolTask is one object to (re)create on the target node. For an
  * edge-gated source it also carries the in-degree (count of not-yet-created
- * prerequisites that are also tasks) and a successor list; for a streaming-leaf
- * source those stay at their zero-initialized values (in-degree 0, no successors).
+ * prerequisites that are also tasks) and its CSR successor range (successorStart/
+ * successorCount index into the owning pool's flat successorIds array -- see
+ * that field's comment); for a streaming-leaf source those stay at their
+ * zero-initialized values (in-degree 0, no successors).
  */
 typedef struct MetadataSyncPoolTask
 {
 	ObjectAddress objectAddress;
 	int inDegree;
-	List *successors;           /* List of MetadataSyncPoolTask * */
+	int32 successorStart;      /* index into pool->successorIds where this task's successors begin */
+	int32 successorCount;      /* number of successors, starting at successorStart */
 	bool dispatched;
 	bool done;
 } MetadataSyncPoolTask;
@@ -118,10 +121,31 @@ typedef struct MetadataSyncPool
 	/* progress/log label, e.g. "dependency objects", "shell tables" */
 	const char *objectLabel;
 
-	/* edge-gated source: tasks materialized up front, drained with in-degree gating */
-	HTAB *taskByAddress;
-	List *taskList;             /* all MetadataSyncPoolTask *, for iteration/seeding */
-	List *readyQueue;           /* MetadataSyncPoolTask * with inDegree 0, not dispatched */
+	/*
+	 * edge-gated source: tasks materialized up front (one per row of the
+	 * dependency-ordered address tuplestore, in read order) and drained with
+	 * in-degree gating. Every structure below is a flat array sized once
+	 * totalTasks is known (MetadataSyncPoolRegisterTasks uses
+	 * tuplestore_tuple_count() to presize them exactly) -- there is no
+	 * ObjectAddress-keyed HTAB in the pool at all, because
+	 * OrderObjectAddressTuplestoreInDependencyOrderWithEdges() already assigns
+	 * each task its dense id and resolves every edge to an id pair upstream
+	 * (see dependency.c); MetadataSyncPoolApplyEdges() only ever indexes taskById
+	 * by that id.
+	 */
+	MetadataSyncPoolTask **taskById; /* array[totalTasks], indexed by dense task id */
+	int32 *successorIds;             /* flat CSR successor array; see MetadataSyncPoolTask.successorStart/successorCount */
+
+	/*
+	 * readyQueue is a plain int32 FIFO array of task ids, sized totalTasks: each
+	 * task id is pushed onto it at most once (when it first becomes in-degree 0)
+	 * and popped at most once, so readyHead/readyTail are both monotonically
+	 * increasing and never wrap around -- unlike a List-based queue, popping
+	 * never has to shift any remaining elements.
+	 */
+	int32 *readyQueue;
+	int64 readyHead;   /* next slot to pop (readyQueue[readyHead]); readyHead == readyTail means empty */
+	int64 readyTail;   /* next slot to push (readyQueue[readyTail++] = id) */
 	int64 remainingTasks;
 
 	/* streaming-leaf source: on-demand catalog scan, at most K live tasks */
@@ -148,21 +172,16 @@ extern void OpenStreamingLeafSource(MetadataSyncPool *pool, Oid scanRelationId,
 									Oid (*extractOid)(HeapTuple, TupleDesc),
 									List *(*builder)(Oid));
 extern void MetadataSyncPoolRegisterTasks(MetadataSyncPool *pool,
-										  List *taskAddresses);
-extern void MetadataSyncPoolApplyEdges(MetadataSyncPool *pool, List *edgeList);
+										  Tuplestorestate *taskAddressStore,
+										  TupleDesc taskAddressTupleDesc);
+extern void MetadataSyncPoolApplyEdges(MetadataSyncPool *pool,
+									   Tuplestorestate *edgeStore,
+									   TupleDesc edgeTupleDesc);
 extern void RunMetadataSyncPool(MetadataSyncPool *pool);
 extern void CloseMetadataSyncPool(MetadataSyncPool *pool);
 
 /* public support functions */
 extern const MetadataSyncTaskSourceOps EdgeGatedSourceOps;
 extern const MetadataSyncTaskSourceOps StreamingLeafSourceOps;
-
-/* public streaming-leaf source - shell table extract / builder functions */
-extern Oid ShellTableStreamExtractOid(HeapTuple tuple, TupleDesc tupleDesc);
-extern List * ShellTableStreamBuilder(Oid relationId);
-
-/* public streaming-leaf source - sequence extract / builder functions */
-extern Oid SequenceStreamExtractOid(HeapTuple tuple, TupleDesc tupleDesc);
-extern List * SequenceStreamBuilder(Oid sequenceId);
 
 #endif   /* CITUS_METADATA_SYNC_POOL_H */

@@ -16,11 +16,8 @@
 #include "catalog/pg_class.h"
 
 #include "distributed/listutils.h"
-#include "distributed/metadata/distobject.h"
-#include "distributed/metadata/pg_dist_object.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/metadata_sync_pool.h"
-#include "distributed/metadata_utility.h"
 
 /* edge-gated source - support functions */
 static void EdgeGatedSeed(MetadataSyncPool *pool);
@@ -58,43 +55,42 @@ const MetadataSyncTaskSourceOps StreamingLeafSourceOps = {
 
 /*
  * EdgeGatedSeed seeds the edge-gated ready queue with every in-degree-0 task, so
- * the drain can begin dispatching them to idle connections.
+ * the drain can begin dispatching them to idle connections. pool->readyQueue is
+ * a plain int32 FIFO array sized totalTasks (see its declaration): each task id
+ * is pushed at most once in its lifetime (once here if it starts in-degree 0,
+ * or once later in EdgeGatedOnComplete() when its in-degree first reaches 0),
+ * so this initial push can never overflow the array even though later pushes
+ * also land in it.
  */
 static void
 EdgeGatedSeed(MetadataSyncPool *pool)
 {
-	MemoryContext oldContext = MemoryContextSwitchTo(pool->poolContext);
-	MetadataSyncPoolTask *task = NULL;
-	foreach_ptr(task, pool->taskList)
+	for (int64 taskId = 0; taskId < pool->totalTasks; taskId++)
 	{
-		if (task->inDegree == 0)
+		if (pool->taskById[taskId]->inDegree == 0)
 		{
-			pool->readyQueue = lappend(pool->readyQueue, task);
+			pool->readyQueue[pool->readyTail++] = (int32) taskId;
 		}
 	}
-	MemoryContextSwitchTo(oldContext);
 }
 
 
 /*
- * EdgeGatedPullReady pops the next in-degree-0 task off the edge-gated ready
- * queue, or returns NULL if the queue is currently empty.
+ * EdgeGatedPullReady pops the next in-degree-0 task id off the edge-gated ready
+ * queue, or returns NULL if the queue is currently empty. Popping is a plain
+ * cursor advance (readyHead++), never a shift of the remaining entries, because
+ * the queue is a flat array rather than a List.
  */
 static MetadataSyncPoolTask *
 EdgeGatedPullReady(MetadataSyncPool *pool)
 {
-	if (pool->readyQueue == NIL)
+	if (pool->readyHead == pool->readyTail)
 	{
 		return NULL;
 	}
 
-	MetadataSyncPoolTask *task = linitial(pool->readyQueue);
-
-	MemoryContext queueContext = MemoryContextSwitchTo(pool->poolContext);
-	pool->readyQueue = list_delete_first(pool->readyQueue);
-	MemoryContextSwitchTo(queueContext);
-
-	return task;
+	int32 taskId = pool->readyQueue[pool->readyHead++];
+	return pool->taskById[taskId];
 }
 
 
@@ -116,7 +112,8 @@ EdgeGatedDeparse(MetadataSyncPool *pool, MetadataSyncPoolTask *task)
  * and cache-flush bookkeeping, and decrements each successor's in-degree,
  * enqueuing any successor that becomes ready (in-degree 0). Used both when a
  * task's DDL was executed on a connection and when an object with no commands is
- * completed inline.
+ * completed inline. Successors are walked via the task's CSR range
+ * (successorStart/successorCount indexing into pool->successorIds), not a List.
  */
 static void
 EdgeGatedOnComplete(MetadataSyncPool *pool, MetadataSyncPoolTask *task)
@@ -129,16 +126,17 @@ EdgeGatedOnComplete(MetadataSyncPool *pool, MetadataSyncPoolTask *task)
 	LogMetadataSyncProgress(pool->objectLabel, pool->completedTasks - 1,
 							pool->completedTasks, pool->totalTasks);
 
-	MetadataSyncPoolTask *successor = NULL;
-	foreach_ptr(successor, task->successors)
+	for (int32 successorIndex = 0; successorIndex < task->successorCount;
+		successorIndex++)
 	{
+		int32 successorId = pool->successorIds[task->successorStart + successorIndex];
+		MetadataSyncPoolTask *successor = pool->taskById[successorId];
+
 		successor->inDegree--;
 
 		if (successor->inDegree == 0 && !successor->dispatched && !successor->done)
 		{
-			MemoryContext oldContext = MemoryContextSwitchTo(pool->poolContext);
-			pool->readyQueue = lappend(pool->readyQueue, successor);
-			MemoryContextSwitchTo(oldContext);
+			pool->readyQueue[pool->readyTail++] = successorId;
 		}
 	}
 }
@@ -197,7 +195,8 @@ StreamingLeafPullReady(MetadataSyncPool *pool)
 		MetadataSyncPoolTask *task = palloc0(sizeof(MetadataSyncPoolTask));
 		ObjectAddressSet(task->objectAddress, RelationRelationId, objectId);
 		task->inDegree = 0;
-		task->successors = NIL;
+		task->successorStart = 0;
+		task->successorCount = 0;
 		task->dispatched = false;
 		task->done = false;
 		MemoryContextSwitchTo(oldContext);
@@ -253,82 +252,4 @@ StreamingLeafClose(MetadataSyncPool *pool)
 		pool->streamScan = NULL;
 		pool->streamRelation = NULL;
 	}
-}
-
-
-/*
- * ShellTableStreamExtractOid maps a pg_dist_partition tuple to the OID of the
- * distributed table whose shell table should be created on the target node. It is
- * the STREAMING_LEAF source extractor for the shell-table pool phase.
- */
-Oid
-ShellTableStreamExtractOid(HeapTuple tuple, TupleDesc tupleDesc)
-{
-	return FetchRelationIdFromPgPartitionHeapTuple(tuple, tupleDesc);
-}
-
-
-/*
- * ShellTableStreamBuilder returns the shell table creation command bundle for a
- * distributed table, or NIL for extension-owned tables (which are created with
- * their extension, exactly as the serial dependency path skips them). It is the
- * STREAMING_LEAF source builder for the shell-table pool phase.
- */
-List *
-ShellTableStreamBuilder(Oid relationId)
-{
-	ObjectAddress tableAddress = { 0 };
-	ObjectAddressSet(tableAddress, RelationRelationId, relationId);
-	if (IsAnyObjectAddressOwnedByExtension(list_make1(&tableAddress), NULL))
-	{
-		return NIL;
-	}
-
-	bool bundlePartitionMetadata = true;
-	return ShellTableCreationCommandList(relationId, bundlePartitionMetadata);
-}
-
-
-/*
- * SequenceStreamExtractOid maps a pg_dist_object tuple to the OID of the
- * distributed sequence to create, or InvalidOid when the tuple is not a
- * distributed sequence. It is the STREAMING_LEAF source extractor for the
- * sequence pool phase.
- *
- * It uses the same predicate (ObjectIsSequence) that excludes
- * distributed sequences from the serial dependency ordering phase, keeping the
- * "excluded there == created here" invariant in one place.
- */
-Oid
-SequenceStreamExtractOid(HeapTuple tuple, TupleDesc tupleDesc)
-{
-	Form_pg_dist_object distObjectForm = (Form_pg_dist_object) GETSTRUCT(tuple);
-	Oid classId = distObjectForm->classid;
-	Oid objId = distObjectForm->objid;
-
-	if (!ObjectIsSequence(classId, objId))
-	{
-		return InvalidOid;
-	}
-
-	return objId;
-}
-
-
-/*
- * SequenceStreamBuilder returns the CREATE bundle for a distributed sequence, or
- * NIL when the sequence is extension-owned. It is the STREAMING_LEAF source
- * builder for the sequence pool phase.
- */
-List *
-SequenceStreamBuilder(Oid sequenceId)
-{
-	ObjectAddress seqAddress = { 0 };
-	ObjectAddressSet(seqAddress, RelationRelationId, sequenceId);
-	if (IsAnyObjectAddressOwnedByExtension(list_make1(&seqAddress), NULL))
-	{
-		return NIL;
-	}
-
-	return DDLCommandsForSequence(sequenceId, TableOwner(sequenceId));
 }

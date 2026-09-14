@@ -56,9 +56,7 @@ static char * CreatePgDistObjectEntryCommand(const ObjectAddress *objectAddress)
 static int ExecuteCommandAsSuperuser(char *query, int paramCount, Oid *paramTypes,
 									 Datum *paramValues);
 static bool IsObjectDistributed(const ObjectAddress *address);
-static List * GetDistributedObjectAddressListInternal(bool excludeCitusShellTables,
-													  bool excludeDistributedSequences);
-static bool ObjectIsCitusTableViaCitusCatalog(Oid classId, Oid objId);
+static List * GetDistributedObjectAddressListInternal(void);
 
 PG_FUNCTION_INFO_V1(citus_unmark_object_distributed);
 PG_FUNCTION_INFO_V1(master_unmark_object_distributed);
@@ -450,46 +448,23 @@ IsAnyObjectDistributed(const List *addresses)
 
 
 /*
- * GetDistributedObjectAddressListWithoutShellTablesAndSequences returns the
- * distributed objects marked in pg_dist_object except the Citus shell tables
- * and the distributed sequences.
- */
-List *
-GetDistributedObjectAddressListWithoutShellTablesAndSequences(void)
-{
-	bool excludeCitusShellTables = true;
-	bool excludeDistributedSequences = true;
-	return GetDistributedObjectAddressListInternal(excludeCitusShellTables,
-												   excludeDistributedSequences);
-}
-
-
-/*
  * GetDistributedObjectAddressList returns a list of ObjectAddresses that contains all
  * distributed objects as marked in pg_dist_object
  */
 List *
 GetDistributedObjectAddressList(void)
 {
-	bool excludeCitusShellTables = false;
-	bool excludeDistributedSequences = false;
-	return GetDistributedObjectAddressListInternal(excludeCitusShellTables,
-												   excludeDistributedSequences);
+	return GetDistributedObjectAddressListInternal();
 }
 
 
 /*
  * GetDistributedObjectAddressListInternal is the shared implementation behind
- * GetDistributedObjectAddressList() and its shell-table / sequence excluding
- * variants. It scans pg_dist_object and returns an ObjectAddress list of the
- * distributed objects, optionally skipping Citus shell tables and/or
- * distributed sequences during the scan. Note that; to skip the desired object
- * kinds, it scans relevant catalog to determine, so be cautious when asking for
- * exclusions in hot code-paths.
+ * GetDistributedObjectAddressList(). It scans pg_dist_object and returns an
+ * ObjectAddress list of all the distributed objects found there.
  */
 static List *
-GetDistributedObjectAddressListInternal(bool excludeCitusShellTables,
-										bool excludeDistributedSequences)
+GetDistributedObjectAddressListInternal(void)
 {
 	HeapTuple pgDistObjectTup = NULL;
 	List *objectAddressList = NIL;
@@ -502,19 +477,6 @@ GetDistributedObjectAddressListInternal(bool excludeCitusShellTables,
 	{
 		Form_pg_dist_object pg_dist_object =
 			(Form_pg_dist_object) GETSTRUCT(pgDistObjectTup);
-
-		if (excludeCitusShellTables &&
-			ObjectIsCitusTableViaCitusCatalog(pg_dist_object->classid,
-											  pg_dist_object->objid))
-		{
-			continue;
-		}
-
-		if (excludeDistributedSequences &&
-			ObjectIsSequence(pg_dist_object->classid, pg_dist_object->objid))
-		{
-			continue;
-		}
 
 		ObjectAddress *objectAddress = palloc0(sizeof(ObjectAddress));
 		ObjectAddressSubSet(*objectAddress,
@@ -532,27 +494,48 @@ GetDistributedObjectAddressListInternal(bool excludeCitusShellTables,
 
 
 /*
- * ObjectIsCitusTableViaCitusCatalog returns whether the object identified by
- * (classId, objId) refers to a Citus table.
+ * GetDistributedObjectAddressTuplestore is the tuplestore-backed counterpart of
+ * GetDistributedObjectAddressList(): it scans pg_dist_object for all distributed
+ * objects, uniformly (no shell-table/sequence/any-other-kind exclusion), and
+ * writes each ObjectAddress to a new tuplestore instead of appending to a List.
+ * This keeps the scan memory-bounded even when pg_dist_object holds a very
+ * large number of rows (e.g. millions of Citus shell tables), since
+ * Tuplestorestate spills to a temp file once its content exceeds work_mem.
  *
- * This doesn't access Citus caches.
+ * The returned tuplestore and TupleDesc are allocated in the current memory
+ * context and owned by the caller.
  */
-static bool
-ObjectIsCitusTableViaCitusCatalog(Oid classId, Oid objId)
+void
+GetDistributedObjectAddressTuplestore(Tuplestorestate **tupleStoreOut,
+									  TupleDesc *tupleDescOut)
 {
-	if (classId != RelationRelationId)
+	TupleDesc tupleDesc = CreateObjectAddressTupleDesc();
+	Tuplestorestate *tupleStore = tuplestore_begin_heap(false, false, work_mem);
+
+	HeapTuple pgDistObjectTup = NULL;
+	Relation pgDistObjectRel = table_open(DistObjectRelationId(), AccessShareLock);
+	SysScanDesc pgDistObjectScan = systable_beginscan(pgDistObjectRel, InvalidOid, false,
+													  NULL, 0,
+													  NULL);
+	while (HeapTupleIsValid(pgDistObjectTup = systable_getnext(pgDistObjectScan)))
 	{
-		return false;
+		Form_pg_dist_object pg_dist_object =
+			(Form_pg_dist_object) GETSTRUCT(pgDistObjectTup);
+
+		ObjectAddress objectAddress = { 0 };
+		ObjectAddressSubSet(objectAddress,
+							pg_dist_object->classid,
+							pg_dist_object->objid,
+							pg_dist_object->objsubid);
+
+		PutObjectAddressToTuplestore(tupleStore, tupleDesc, &objectAddress);
 	}
 
-	char relKind = get_rel_relkind(objId);
-	if (relKind != RELKIND_RELATION && relKind != RELKIND_PARTITIONED_TABLE &&
-		relKind != RELKIND_FOREIGN_TABLE)
-	{
-		return false;
-	}
+	systable_endscan(pgDistObjectScan);
+	relation_close(pgDistObjectRel, AccessShareLock);
 
-	return IsCitusTableViaCatalog(objId);
+	*tupleStoreOut = tupleStore;
+	*tupleDescOut = tupleDesc;
 }
 
 
@@ -700,20 +683,4 @@ DistributedSequenceList(void)
 	systable_endscan(pgDistObjectScan);
 	relation_close(pgDistObjectRel, AccessShareLock);
 	return distributedSequenceList;
-}
-
-
-/*
- * ObjectIsSequence returns whether the object identified by
- * (classId, objId) refers to a sequence.
- */
-bool
-ObjectIsSequence(Oid classId, Oid objId)
-{
-	if (classId != RelationRelationId)
-	{
-		return false;
-	}
-
-	return get_rel_relkind(objId) == RELKIND_SEQUENCE;
 }

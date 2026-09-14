@@ -35,11 +35,13 @@
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "common/hashfn.h"
+#include "executor/tuptable.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 
 #include "pg_version_constants.h"
 
@@ -55,20 +57,56 @@
 #include "distributed/version_compat.h"
 
 /*
+ * ObjectAddressCollectorEntry is one entry of ObjectAddressCollector's merged
+ * addressInfo HTAB (see that field's comment): it tracks whether the address
+ * has been visited during traversal, whether it has been collected into the
+ * ordered output, and -- when the collector is used in tuplestore mode -- the
+ * dense int32 task id assigned to it at collection time. id is only meaningful
+ * when collected is true and the collector is in tuplestore mode; it is -1
+ * otherwise.
+ */
+typedef struct ObjectAddressCollectorEntry
+{
+	ObjectAddress key;
+	bool visited;
+	bool collected;
+	int32 id;
+} ObjectAddressCollectorEntry;
+
+/*
  * ObjectAddressCollector keeps track of collected ObjectAddresses. This can be used
  * together with RecurseObjectDependencies.
  *
- * We keep three different datastructures for the following reasons
+ * We keep two different datastructures for the following reasons
  *  - A List ordered by insert/collect order
- *  - A Set to quickly O(1) check if an ObjectAddress has already been collected
- *  - A set to check which objects are already visited
+ *  - A single HTAB (addressInfo) that answers both "has this been visited" and
+ *    "has this been collected" in one probe (see addressInfo's comment)
  */
 typedef struct ObjectAddressCollector
 {
 	List *dependencyList;
-	HTAB *dependencySet;
 
-	HTAB *visitedObjects;
+	/*
+	 * addressInfo merges what used to be two separate hash sets -- a "have we
+	 * collected this" set and a "have we visited this during traversal" set --
+	 * into one HTAB keyed by ObjectAddress. Every collected address was
+	 * necessarily visited first: RecurseObjectDependencies() marks an address
+	 * visited on entry, and only calls apply() (which collects) for an address
+	 * after that address's own RecurseObjectDependencies() call has returned.
+	 * So merging halves the hash probes on the hottest per-object recursion
+	 * path (TargetObjectVisited + IsObjectAddressCollected used to be lookups
+	 * on two different tables; now one lookup on one table) and halves the
+	 * traversal-phase HTAB memory, without changing which addresses end up
+	 * "visited" or "collected".
+	 */
+	HTAB *addressInfo;
+
+	/*
+	 * nextTaskId is a dense id counter, incremented each time
+	 * CollectObjectAddress() collects an address while collector->dependencyStore
+	 * is set (tuplestore mode). It is unused (and meaningless) in List mode.
+	 */
+	int32 nextTaskId;
 
 	/*
 	 * When recordEdges is true, every direct dependency edge encountered during
@@ -78,6 +116,32 @@ typedef struct ObjectAddressCollector
 	 */
 	bool recordEdges;
 	List *edgeList;
+
+	/*
+	 * When dependencyStore is non-NULL, CollectObjectAddress() writes collected
+	 * addresses there instead of appending to dependencyList. This is opt-in and
+	 * used only by the tuplestore-based entry point
+	 * (OrderObjectAddressTuplestoreInDependencyOrderWithEdges); every other
+	 * caller of this collector leaves this NULL and keeps the List-based
+	 * behavior above unchanged. addressInfo (above) is never tuplestore-backed:
+	 * it needs O(1) keyed lookup while the traversal is still in progress, not
+	 * passive storage of a finished result, so it stays a regular in-memory HTAB
+	 * bounded by the distinct object count either way.
+	 */
+	Tuplestorestate *dependencyStore;
+	TupleDesc dependencyStoreTupleDesc;
+
+	/*
+	 * edgeStore/edgeStoreTupleDesc hold the RAW (ObjectAddress, ObjectAddress)
+	 * edges as they are discovered mid-traversal, in tuplestore mode. They are a
+	 * scratch structure private to
+	 * OrderObjectAddressTuplestoreInDependencyOrderWithEdges(), which resolves
+	 * them to dense-id pairs in one pass right after the traversal loop (using
+	 * addressInfo, while it is still populated) and returns THAT resolved
+	 * tuplestore to its own caller -- not this scratch one.
+	 */
+	Tuplestorestate *edgeStore;
+	TupleDesc edgeStoreTupleDesc;
 } ObjectAddressCollector;
 
 /*
@@ -433,6 +497,466 @@ OrderObjectAddressListInDependencyOrderInternal(List *objectAddressList,
 
 
 /*
+ * CreateObjectAddressTupleDesc builds the 3-column TupleDesc (classid, objid,
+ * objsubid) used to represent an ObjectAddress as a tuplestore row.
+ */
+TupleDesc
+CreateObjectAddressTupleDesc(void)
+{
+	TupleDesc tupleDesc = CreateTemplateTupleDesc(3);
+	TupleDescInitEntry(tupleDesc, (AttrNumber) 1, "classid", OIDOID, -1, 0);
+	TupleDescInitEntry(tupleDesc, (AttrNumber) 2, "objid", OIDOID, -1, 0);
+	TupleDescInitEntry(tupleDesc, (AttrNumber) 3, "objsubid", INT4OID, -1, 0);
+	return tupleDesc;
+}
+
+
+/*
+ * CreateObjectDependencyEdgeTupleDesc builds the 6-column TupleDesc used to
+ * represent an ObjectDependencyEdge (a prereq ObjectAddress followed by a
+ * dependent ObjectAddress) as a tuplestore row.
+ */
+TupleDesc
+CreateObjectDependencyEdgeTupleDesc(void)
+{
+	TupleDesc tupleDesc = CreateTemplateTupleDesc(6);
+	TupleDescInitEntry(tupleDesc, (AttrNumber) 1, "prereq_classid", OIDOID, -1, 0);
+	TupleDescInitEntry(tupleDesc, (AttrNumber) 2, "prereq_objid", OIDOID, -1, 0);
+	TupleDescInitEntry(tupleDesc, (AttrNumber) 3, "prereq_objsubid", INT4OID, -1, 0);
+	TupleDescInitEntry(tupleDesc, (AttrNumber) 4, "dependent_classid", OIDOID, -1, 0);
+	TupleDescInitEntry(tupleDesc, (AttrNumber) 5, "dependent_objid", OIDOID, -1, 0);
+	TupleDescInitEntry(tupleDesc, (AttrNumber) 6, "dependent_objsubid", INT4OID, -1, 0);
+	return tupleDesc;
+}
+
+
+/*
+ * CreateObjectAddressTupleSlot creates a reusable slot for reading ObjectAddress
+ * rows out of a tuplestore built from CreateObjectAddressTupleDesc(). The caller
+ * creates the slot once before a scan loop and drops it with
+ * ExecDropSingleTupleTableSlot() once done, instead of paying a palloc/pfree per
+ * row for what can be a many-million-row scan.
+ */
+TupleTableSlot *
+CreateObjectAddressTupleSlot(TupleDesc tupleDesc)
+{
+	return MakeSingleTupleTableSlot(tupleDesc, &TTSOpsMinimalTuple);
+}
+
+
+/*
+ * CreateObjectDependencyEdgeTupleSlot is the ObjectDependencyEdge counterpart of
+ * CreateObjectAddressTupleSlot().
+ */
+TupleTableSlot *
+CreateObjectDependencyEdgeTupleSlot(TupleDesc tupleDesc)
+{
+	return MakeSingleTupleTableSlot(tupleDesc, &TTSOpsMinimalTuple);
+}
+
+
+/*
+ * PutObjectAddressToTuplestore appends one ObjectAddress row to tupleStore.
+ */
+void
+PutObjectAddressToTuplestore(Tuplestorestate *tupleStore, TupleDesc tupleDesc,
+							 const ObjectAddress *address)
+{
+	Datum values[3];
+	bool isNulls[3] = { false, false, false };
+
+	values[0] = ObjectIdGetDatum(address->classId);
+	values[1] = ObjectIdGetDatum(address->objectId);
+	values[2] = Int32GetDatum(address->objectSubId);
+
+	tuplestore_putvalues(tupleStore, tupleDesc, values, isNulls);
+}
+
+
+/*
+ * GetNextObjectAddressFromTuplestore reads the next ObjectAddress row from
+ * tupleStore (forward direction only) into *addressOut and returns true, or
+ * returns false once the tuplestore is exhausted. slot must have been created
+ * with CreateObjectAddressTupleSlot() and is reused across the whole scan.
+ */
+bool
+GetNextObjectAddressFromTuplestore(Tuplestorestate *tupleStore, TupleTableSlot *slot,
+								   ObjectAddress *addressOut)
+{
+	bool forward = true;
+	if (!tuplestore_gettupleslot(tupleStore, forward, false, slot))
+	{
+		return false;
+	}
+
+	slot_getallattrs(slot);
+
+	addressOut->classId = DatumGetObjectId(slot->tts_values[0]);
+	addressOut->objectId = DatumGetObjectId(slot->tts_values[1]);
+	addressOut->objectSubId = DatumGetInt32(slot->tts_values[2]);
+
+	ExecClearTuple(slot);
+
+	return true;
+}
+
+
+/*
+ * PutObjectDependencyEdgeToTuplestore appends one ObjectDependencyEdge row to
+ * tupleStore.
+ */
+void
+PutObjectDependencyEdgeToTuplestore(Tuplestorestate *tupleStore, TupleDesc tupleDesc,
+									const ObjectDependencyEdge *edge)
+{
+	Datum values[6];
+	bool isNulls[6] = { false, false, false, false, false, false };
+
+	values[0] = ObjectIdGetDatum(edge->prereq.classId);
+	values[1] = ObjectIdGetDatum(edge->prereq.objectId);
+	values[2] = Int32GetDatum(edge->prereq.objectSubId);
+	values[3] = ObjectIdGetDatum(edge->dependent.classId);
+	values[4] = ObjectIdGetDatum(edge->dependent.objectId);
+	values[5] = Int32GetDatum(edge->dependent.objectSubId);
+
+	tuplestore_putvalues(tupleStore, tupleDesc, values, isNulls);
+}
+
+
+/*
+ * GetNextObjectDependencyEdgeFromTuplestore is the ObjectDependencyEdge
+ * counterpart of GetNextObjectAddressFromTuplestore().
+ */
+bool
+GetNextObjectDependencyEdgeFromTuplestore(Tuplestorestate *tupleStore,
+										  TupleTableSlot *slot,
+										  ObjectDependencyEdge *edgeOut)
+{
+	bool forward = true;
+	if (!tuplestore_gettupleslot(tupleStore, forward, false, slot))
+	{
+		return false;
+	}
+
+	slot_getallattrs(slot);
+
+	edgeOut->prereq.classId = DatumGetObjectId(slot->tts_values[0]);
+	edgeOut->prereq.objectId = DatumGetObjectId(slot->tts_values[1]);
+	edgeOut->prereq.objectSubId = DatumGetInt32(slot->tts_values[2]);
+	edgeOut->dependent.classId = DatumGetObjectId(slot->tts_values[3]);
+	edgeOut->dependent.objectId = DatumGetObjectId(slot->tts_values[4]);
+	edgeOut->dependent.objectSubId = DatumGetInt32(slot->tts_values[5]);
+
+	ExecClearTuple(slot);
+
+	return true;
+}
+
+
+/*
+ * CreateObjectDependencyEdgeIdTupleDesc creates the TupleDesc for a resolved,
+ * dense-id edge tuplestore: two int4 columns, (prereqTaskId, dependentTaskId).
+ * See the header comment on ObjectDependencyEdge's id counterpart for why this
+ * is a separate, smaller format from the 6-column ObjectDependencyEdge one.
+ */
+TupleDesc
+CreateObjectDependencyEdgeIdTupleDesc(void)
+{
+	TupleDesc tupleDescriptor = CreateTemplateTupleDesc(2);
+
+	TupleDescInitEntry(tupleDescriptor, (AttrNumber) 1, "prereq_task_id",
+					   INT4OID, -1, 0);
+	TupleDescInitEntry(tupleDescriptor, (AttrNumber) 2, "dependent_task_id",
+					   INT4OID, -1, 0);
+
+	return tupleDescriptor;
+}
+
+
+/*
+ * CreateObjectDependencyEdgeIdTupleSlot creates a TupleTableSlot matching
+ * CreateObjectDependencyEdgeIdTupleDesc()'s TupleDesc.
+ */
+TupleTableSlot *
+CreateObjectDependencyEdgeIdTupleSlot(TupleDesc tupleDesc)
+{
+	return MakeSingleTupleTableSlot(tupleDesc, &TTSOpsMinimalTuple);
+}
+
+
+/*
+ * PutObjectDependencyEdgeIdsToTuplestore appends one resolved (prereqTaskId,
+ * dependentTaskId) edge row to tupleStore.
+ */
+void
+PutObjectDependencyEdgeIdsToTuplestore(Tuplestorestate *tupleStore, TupleDesc tupleDesc,
+									   int32 prereqTaskId, int32 dependentTaskId)
+{
+	Datum values[2];
+	bool isNulls[2] = { false, false };
+
+	values[0] = Int32GetDatum(prereqTaskId);
+	values[1] = Int32GetDatum(dependentTaskId);
+
+	tuplestore_putvalues(tupleStore, tupleDesc, values, isNulls);
+}
+
+
+/*
+ * GetNextObjectDependencyEdgeIdsFromTuplestore is the dense-id counterpart of
+ * GetNextObjectDependencyEdgeFromTuplestore().
+ */
+bool
+GetNextObjectDependencyEdgeIdsFromTuplestore(Tuplestorestate *tupleStore,
+											 TupleTableSlot *slot,
+											 int32 *prereqTaskId,
+											 int32 *dependentTaskId)
+{
+	bool forward = true;
+	if (!tuplestore_gettupleslot(tupleStore, forward, false, slot))
+	{
+		return false;
+	}
+
+	slot_getallattrs(slot);
+
+	*prereqTaskId = DatumGetInt32(slot->tts_values[0]);
+	*dependentTaskId = DatumGetInt32(slot->tts_values[1]);
+
+	ExecClearTuple(slot);
+
+	return true;
+}
+
+
+/*
+ * ResolveObjectAddressToTaskId resolves a single ObjectAddress endpoint of a raw
+ * edge to the dense task id assigned to it during traversal (in collector's
+ * still-live addressInfo HTAB): an address that was itself collected resolves to
+ * its own id; an address that was not collected (dropped upstream, e.g. because
+ * it is extension-owned -- see the top-level skip in
+ * OrderObjectAddressTuplestoreInDependencyOrderWithEdges) but is owned by an
+ * extension resolves to that EXTENSION's id instead, because the extension is
+ * what actually gets (re)created and the real ordering constraint runs through
+ * it (mirrors MetadataSyncPoolApplyEdges' pre-existing resolution rule, just run
+ * once here instead of once per node). Returns false (leaving *taskId
+ * untouched) if neither the address nor its owning extension was collected, in
+ * which case the edge must be dropped by the caller.
+ */
+static bool
+ResolveObjectAddressToTaskId(ObjectAddressCollector *collector,
+							 const ObjectAddress *address, int32 *taskId)
+{
+	bool found = false;
+	ObjectAddressCollectorEntry *entry =
+		(ObjectAddressCollectorEntry *) hash_search(collector->addressInfo, address,
+													HASH_FIND, &found);
+
+	if (found && entry->collected)
+	{
+		*taskId = entry->id;
+		return true;
+	}
+
+	ObjectAddress extensionAddress = { 0 };
+	if (IsObjectAddressOwnedByExtension(address, &extensionAddress))
+	{
+		entry = (ObjectAddressCollectorEntry *) hash_search(collector->addressInfo,
+															&extensionAddress,
+															HASH_FIND, &found);
+		if (found && entry->collected)
+		{
+			*taskId = entry->id;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * ResolveObjectDependencyEdgesToTaskIds reads every raw (ObjectAddress,
+ * ObjectAddress) edge out of collector->edgeStore, resolves both endpoints to
+ * dense task ids via collector->addressInfo (still fully populated at this
+ * point -- this must run before that HTAB is torn down), and returns a brand
+ * new tuplestore of the resolved (prereqTaskId, dependentTaskId) int32 pairs.
+ * An edge whose endpoint cannot be resolved to any task (created out of band,
+ * exactly as the serial path assumes) is dropped, as is a self-edge (including
+ * one that only becomes a self-edge after the extension-collapse in
+ * ResolveObjectAddressToTaskId) -- both matching MetadataSyncPoolApplyEdges'
+ * pre-existing behavior, just performed once here instead of once per node.
+ *
+ * collector->edgeStore itself is torn down (tuplestore_end) once fully read,
+ * since it is pure scratch state private to this resolution pass.
+ */
+static Tuplestorestate *
+ResolveObjectDependencyEdgesToTaskIds(ObjectAddressCollector *collector)
+{
+	TupleDesc resolvedTupleDesc = CreateObjectDependencyEdgeIdTupleDesc();
+	Tuplestorestate *resolvedEdgeStore = tuplestore_begin_heap(false, false, work_mem);
+
+	TupleTableSlot *edgeSlot =
+		CreateObjectDependencyEdgeTupleSlot(collector->edgeStoreTupleDesc);
+
+	tuplestore_rescan(collector->edgeStore);
+
+	ObjectDependencyEdge edge;
+	while (GetNextObjectDependencyEdgeFromTuplestore(collector->edgeStore, edgeSlot,
+													 &edge))
+	{
+		int32 prereqTaskId = -1;
+		int32 dependentTaskId = -1;
+
+		if (!ResolveObjectAddressToTaskId(collector, &edge.prereq, &prereqTaskId) ||
+			!ResolveObjectAddressToTaskId(collector, &edge.dependent, &dependentTaskId))
+		{
+			/* an endpoint is created out of band; drop the edge */
+			continue;
+		}
+
+		if (prereqTaskId == dependentTaskId)
+		{
+			/* self-edge, possibly only after the extension collapse; ignore */
+			continue;
+		}
+
+		PutObjectDependencyEdgeIdsToTuplestore(resolvedEdgeStore, resolvedTupleDesc,
+											   prereqTaskId, dependentTaskId);
+	}
+
+	ExecDropSingleTupleTableSlot(edgeSlot);
+	tuplestore_end(collector->edgeStore);
+
+	collector->edgeStoreTupleDesc = resolvedTupleDesc;
+	return resolvedEdgeStore;
+}
+
+
+/*
+ * OrderObjectAddressTuplestoreInDependencyOrderWithEdges is the tuplestore-backed
+ * counterpart of OrderObjectAddressListInDependencyOrderWithEdges(): it consumes
+ * objectAddressStore (produced by e.g. GetDistributedObjectAddressTuplestore())
+ * instead of a List, and produces the topologically ordered dependency list and
+ * the dependency graph edges as tuplestores rather than Lists, so a very large
+ * distributed object set is never fully materialized as an in-memory List at any
+ * point in this pipeline.
+ *
+ * It reuses the exact same traversal (RecurseObjectDependencies over
+ * ExpandCitusSupportedTypes/FollowAllSupportedDependencies) as the List-based
+ * entry points; only where the collected addresses/edges are written differs
+ * (see the ObjectAddressCollector.dependencyStore/edgeStore comment).
+ * collector->addressInfo, used mid-traversal, remains a regular in-memory HTAB
+ * either way, but is torn down (hash_destroy) before this function returns, once
+ * the edge-resolution pass below no longer needs it, so its memory is not held
+ * onto through the rest of the phase that consumes *orderedAddressStore.
+ *
+ * Unlike a recursively-discovered dependency (which ApplyAddToDependencyList
+ * already skips when it is extension-owned), a TOP-LEVEL seed address here is
+ * skipped from collection when it is itself extension-owned, mirroring that
+ * same rule: extension-owned objects are (re)created as a side effect of
+ * CREATE EXTENSION, never as their own task, on both paths. This guarantees
+ * every row ever written to *orderedAddressStore -- and thus every dense task
+ * id -- is non-extension-owned, so a caller building tasks from
+ * *orderedAddressStore never has to re-check that itself.
+ *
+ * Every edge returned via *edgeStore / *edgeTupleDesc already has both endpoints
+ * resolved to the dense int32 id of the row of *orderedAddressStore that
+ * created that object (an edge through/into an extension-owned intermediary is
+ * collapsed onto the owning extension's id, and a resulting self-edge or an
+ * edge to/from an object created out of band is dropped) -- see
+ * ResolveObjectDependencyEdgesToTaskIds(). A row's id is simply its 0-based
+ * forward-read position in *orderedAddressStore: ids are handed out in strictly
+ * increasing order as rows are written, and every row is read back in that same
+ * order with none skipped.
+ *
+ * objectAddressStore is scanned forward exactly once; the caller retains
+ * ownership of it (and may tuplestore_end() it once this returns). The two
+ * output tuplestores are allocated in the current memory context and owned by
+ * the caller.
+ */
+void
+OrderObjectAddressTuplestoreInDependencyOrderWithEdges(Tuplestorestate *
+														objectAddressStore,
+														TupleDesc
+														objectAddressTupleDesc,
+														bool flushCaches,
+														Tuplestorestate **
+														orderedAddressStore,
+														TupleDesc *
+														orderedAddressTupleDesc,
+														Tuplestorestate **edgeStore,
+														TupleDesc *edgeTupleDesc)
+{
+	ObjectAddressCollector collector = { 0 };
+	InitObjectAddressCollector(&collector);
+	collector.recordEdges = true;
+
+	collector.dependencyStoreTupleDesc = CreateObjectAddressTupleDesc();
+	collector.dependencyStore = tuplestore_begin_heap(false, false, work_mem);
+
+	collector.edgeStoreTupleDesc = CreateObjectDependencyEdgeTupleDesc();
+	collector.edgeStore = tuplestore_begin_heap(false, false, work_mem);
+
+	TupleTableSlot *inputSlot = CreateObjectAddressTupleSlot(objectAddressTupleDesc);
+
+	tuplestore_rescan(objectAddressStore);
+
+	ObjectAddress objectAddress;
+	int64 processedCount = 0;
+	while (GetNextObjectAddressFromTuplestore(objectAddressStore, inputSlot,
+											  &objectAddress))
+	{
+		if (IsObjectAddressCollected(objectAddress, &collector))
+		{
+			/* skip objects that are already ordered */
+			continue;
+		}
+
+		RecurseObjectDependencies(objectAddress,
+								  &ExpandCitusSupportedTypes,
+								  &FollowAllSupportedDependencies,
+								  &ApplyAddToDependencyList,
+								  &collector);
+
+		if (!IsObjectAddressOwnedByExtension(&objectAddress, NULL))
+		{
+			/*
+			 * Extension-owned objects are (re)created as a side effect of
+			 * CREATE EXTENSION, not as their own task; see the function
+			 * comment. ApplyAddToDependencyList already applies this same
+			 * check for every recursively-discovered dependency above, this is
+			 * only for the top-level seed address itself.
+			 */
+			CollectObjectAddress(&collector, &objectAddress);
+		}
+
+		/* see the matching comment in OrderObjectAddressListInDependencyOrderInternal */
+		if (flushCaches && MetadataSyncCacheFlushIntervalReached(++processedCount))
+		{
+			FlushCachesForMetadataSync();
+		}
+	}
+
+	ExecDropSingleTupleTableSlot(inputSlot);
+
+	*orderedAddressStore = collector.dependencyStore;
+	*orderedAddressTupleDesc = collector.dependencyStoreTupleDesc;
+
+	/*
+	 * Resolve every raw edge to a dense-id pair while collector.addressInfo is
+	 * still populated, then free that HTAB: its traversal-phase memory need not
+	 * be held onto through the rest of the phase (e.g. pool task dispatch) that
+	 * consumes *orderedAddressStore / *edgeStore.
+	 */
+	*edgeStore = ResolveObjectDependencyEdgesToTaskIds(&collector);
+	*edgeTupleDesc = collector.edgeStoreTupleDesc;
+
+	hash_destroy(collector.addressInfo);
+}
+
+
+/*
  * RecurseObjectDependencies recursively visits all dependencies of an object. It sources
  * the dependencies from pg_depend and pg_shdepend while 'expanding' the list via an
  * optional `expand` function.
@@ -653,15 +1177,19 @@ static void
 InitObjectAddressCollector(ObjectAddressCollector *collector)
 {
 	assert_valid_hash_key3(ObjectAddress, classId, objectId, objectSubId);
-	collector->dependencySet = CreateSimpleHashSetWithName(ObjectAddress,
-														   "dependency set");
+	collector->addressInfo = CreateSimpleHashWithName(ObjectAddress,
+													  ObjectAddressCollectorEntry,
+													  "object address info");
 	collector->dependencyList = NULL;
-
-	collector->visitedObjects = CreateSimpleHashSetWithName(ObjectAddress,
-															"visited object set");
+	collector->nextTaskId = 0;
 
 	collector->recordEdges = false;
 	collector->edgeList = NULL;
+
+	collector->dependencyStore = NULL;
+	collector->dependencyStoreTupleDesc = NULL;
+	collector->edgeStore = NULL;
+	collector->edgeStoreTupleDesc = NULL;
 }
 
 
@@ -675,6 +1203,14 @@ static void
 RecordDependencyEdge(ObjectAddressCollector *collector, ObjectAddress prereq,
 					 ObjectAddress dependent)
 {
+	if (collector->edgeStore != NULL)
+	{
+		ObjectDependencyEdge edge = { prereq, dependent };
+		PutObjectDependencyEdgeToTuplestore(collector->edgeStore,
+											collector->edgeStoreTupleDesc, &edge);
+		return;
+	}
+
 	ObjectDependencyEdge *edge = palloc0(sizeof(ObjectDependencyEdge));
 	edge->prereq = prereq;
 	edge->dependent = dependent;
@@ -734,10 +1270,11 @@ TargetObjectVisited(ObjectAddressCollector *collector, ObjectAddress target)
 {
 	bool found = false;
 
-	/* find in set */
-	hash_search(collector->visitedObjects, &target, HASH_FIND, &found);
+	ObjectAddressCollectorEntry *entry =
+		(ObjectAddressCollectorEntry *) hash_search(collector->addressInfo, &target,
+													HASH_FIND, &found);
 
-	return found;
+	return found && entry->visited;
 }
 
 
@@ -750,16 +1287,18 @@ MarkObjectVisited(ObjectAddressCollector *collector, ObjectAddress target)
 {
 	bool found = false;
 
-	/* add to set */
-	ObjectAddress *address = (ObjectAddress *) hash_search(collector->visitedObjects,
-														   &target,
-														   HASH_ENTER, &found);
+	ObjectAddressCollectorEntry *entry =
+		(ObjectAddressCollectorEntry *) hash_search(collector->addressInfo, &target,
+													HASH_ENTER, &found);
 
 	if (!found)
 	{
-		/* copy object address in */
-		*address = target;
+		entry->key = target;
+		entry->collected = false;
+		entry->id = -1;
 	}
+
+	entry->visited = true;
 }
 
 
@@ -771,19 +1310,42 @@ CollectObjectAddress(ObjectAddressCollector *collector, const ObjectAddress *col
 {
 	bool found = false;
 
-	/* add to set */
-	ObjectAddress *address = (ObjectAddress *) hash_search(collector->dependencySet,
-														   collect,
-														   HASH_ENTER, &found);
+	ObjectAddressCollectorEntry *entry =
+		(ObjectAddressCollectorEntry *) hash_search(collector->addressInfo, collect,
+													HASH_ENTER, &found);
 
 	if (!found)
 	{
-		/* copy object address in */
-		*address = *collect;
+		entry->key = *collect;
+		entry->visited = false;
+		entry->id = -1;
+	}
+
+	if (entry->collected)
+	{
+		/*
+		 * Already collected. The traversal never calls this twice for the same
+		 * address in practice (every caller gates on IsObjectAddressCollected()
+		 * or the equivalent "already collected" check inside
+		 * FollowAllSupportedDependencies() first), but guard against it being an
+		 * inert no-op rather than a duplicate list/tuplestore entry, matching
+		 * the pre-existing behavior of the (now-merged) dependencySet HTAB.
+		 */
+		return;
+	}
+
+	entry->collected = true;
+
+	if (collector->dependencyStore != NULL)
+	{
+		entry->id = collector->nextTaskId++;
+		PutObjectAddressToTuplestore(collector->dependencyStore,
+									 collector->dependencyStoreTupleDesc, &entry->key);
+		return;
 	}
 
 	/* add to list*/
-	collector->dependencyList = lappend(collector->dependencyList, address);
+	collector->dependencyList = lappend(collector->dependencyList, &entry->key);
 }
 
 
@@ -797,10 +1359,11 @@ IsObjectAddressCollected(ObjectAddress findAddress,
 {
 	bool found = false;
 
-	/* add to set */
-	hash_search(collector->dependencySet, &findAddress, HASH_FIND, &found);
+	ObjectAddressCollectorEntry *entry =
+		(ObjectAddressCollectorEntry *) hash_search(collector->addressInfo,
+													&findAddress, HASH_FIND, &found);
 
-	return found;
+	return found && entry->collected;
 }
 
 

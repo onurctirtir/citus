@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "catalog/objectaddress.h"
+#include "utils/tuplestore.h"
 
 #define INVALID_DISTRIBUTION_ARGUMENT_INDEX -1
 #define NO_FORCE_PUSHDOWN 0
@@ -35,11 +36,11 @@ extern bool IsObjectAddressOwnedByCitus(const ObjectAddress *objectAddress);
 extern ObjectAddress PgGetObjectAddress(char *ttype, ArrayType *namearr,
 										ArrayType *argsarr);
 extern List * GetDistributedObjectAddressList(void);
-extern List * GetDistributedObjectAddressListWithoutShellTablesAndSequences(void);
+extern void GetDistributedObjectAddressTuplestore(Tuplestorestate **tupleStoreOut,
+												  TupleDesc *tupleDescOut);
 extern RoleSpec * GetRoleSpecObjectForUser(Oid roleOid);
 extern void UpdateDistributedObjectColocationId(uint32 oldColocationId, uint32
 												newColocationId);
 extern List * DistributedFunctionList(void);
 extern List * DistributedSequenceList(void);
-extern bool ObjectIsSequence(Oid classId, Oid objId);
 #endif /* CITUS_METADATA_DISTOBJECT_H */

@@ -116,12 +116,6 @@ static bool MetadataSyncUsePoolEnabled(MetadataSyncContext *context);
 static bool ShouldSyncTableMetadataInternal(bool hashDistributed,
 											bool citusTableWithNoDistKey);
 static bool SyncNodeMetadataSnapshotToNode(WorkerNode *workerNode, bool raiseOnError);
-static void ClassifyDependencyPoolTasks(MetadataSyncContext *context, List *dependencies,
-										List **immediateObjectAddresses,
-										List **deferredObjectAddresses);
-static void SendDependencyCreationCommandsForObjects(MetadataSyncContext *context,
-													 List *objectAddresses);
-static bool IsDependentOnShellTableObject(const ObjectAddress *dependency);
 static void AppendRelationMetadataBatchRowsWithOptionalLockRelease(Oid relationId,
 																   StringInfo
 																   partitionValues,
@@ -5188,53 +5182,59 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 
 	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
 
-	bool poolShellTables = MetadataSyncUsePoolEnabled(context);
+	bool usePool = MetadataSyncUsePoolEnabled(context);
 
-	/*
-	 * Collect all dependencies in creation order and get their ddl commands.
-	 *
-	 * When the pool path is enabled, Citus shell tables and distributed
-	 * sequences are created later over pools of parallel connections
-	 * (SendSequenceCreationCommandsViaPool() and
-	 * SendShellTableCreationCommandsViaPool()). Exclude both from the dependency
-	 * list *at scan time* so a large number of shell tables and sequences
-	 * on a large cluster are never materialized here.
-	 */
-	List *dependencies = poolShellTables ?
-						 GetDistributedObjectAddressListWithoutShellTablesAndSequences() :
-						 GetDistributedObjectAddressList();
-
-	/*
-	 * Depending on changes in the environment, such as the enable_metadata_sync guc
-	 * there might be objects in the distributed object address list that should currently
-	 * not be propagated by citus as they are 'not supported'.
-	 */
-	bool flushCaches = true;
-	dependencies = FilterObjectAddressListByPredicate(dependencies,
-													  &SupportedDependencyByCitus,
-													  flushCaches);
-
-	if (poolShellTables)
+	if (usePool)
 	{
 		/*
-		 * In the pool path, we also need the dependency graph edges (not just a flat
-		 * topological order) so the connection pool can gate: create an object only
-		 * once all of its prerequisites that are themselves tasks have been created.
+		 * Scan every distributed object uniformly, without excluding shell
+		 * tables, sequences, views, publications, or any other object type:
+		 * we cannot assume which object types Citus supports today (or in the
+		 * future) might depend on a table, so the pool path creates ALL
+		 * distributed objects the same way, gated by the dependency graph.
+		 *
+		 * The object-address list and the dependency-edge list are backed by
+		 * disk-spillable tuplestores (rather than in-memory Lists) so a
+		 * cluster with a very large number of distributed objects (e.g.
+		 * millions of shell tables) does not materialize them all in
+		 * coordinator memory.
 		 */
-		List *edgeList = NIL;
-		dependencies =
-			OrderObjectAddressListInDependencyOrderWithEdges(dependencies, flushCaches,
-															 &edgeList);
+		Tuplestorestate *objectAddressStore = NULL;
+		TupleDesc objectAddressTupleDesc = NULL;
+		GetDistributedObjectAddressTuplestore(&objectAddressStore,
+											  &objectAddressTupleDesc);
 
 		/*
-		 * Classify the ordered dependency list into the set of objects the pool will
-		 * create and stashing shell-table-dependent objects for the later deferred
-		 * phase.
+		 * Depending on changes in the environment, such as the
+		 * enable_metadata_sync guc, there might be objects in the distributed
+		 * object address list that should currently not be propagated by
+		 * citus as they are 'not supported'.
 		 */
-		List *immediateObjectAddresses = NIL;
-		List *deferredObjectAddresses = NIL;
-		ClassifyDependencyPoolTasks(context, dependencies, &immediateObjectAddresses,
-									&deferredObjectAddresses);
+		bool flushCaches = true;
+		Tuplestorestate *supportedObjectAddressStore = NULL;
+		TupleDesc supportedObjectAddressTupleDesc = NULL;
+		FilterObjectAddressTuplestoreByPredicate(objectAddressStore,
+												 objectAddressTupleDesc,
+												 &SupportedDependencyByCitus,
+												 flushCaches,
+												 &supportedObjectAddressStore,
+												 &supportedObjectAddressTupleDesc);
+		tuplestore_end(objectAddressStore);
+
+		/*
+		 * We also need the dependency graph edges (not just a flat topological
+		 * order) so the connection pool can gate: create an object only once
+		 * all of its prerequisites that are themselves tasks have been created.
+		 */
+		Tuplestorestate *orderedObjectAddressStore = NULL;
+		TupleDesc orderedObjectAddressTupleDesc = NULL;
+		Tuplestorestate *edgeStore = NULL;
+		TupleDesc edgeTupleDesc = NULL;
+		OrderObjectAddressTuplestoreInDependencyOrderWithEdges(
+			supportedObjectAddressStore, supportedObjectAddressTupleDesc, flushCaches,
+			&orderedObjectAddressStore, &orderedObjectAddressTupleDesc,
+			&edgeStore, &edgeTupleDesc);
+		tuplestore_end(supportedObjectAddressStore);
 
 		int poolSize = MaxAdaptiveExecutorPoolSize;
 
@@ -5247,13 +5247,17 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 				OpenMetadataSyncPool(context, workerNode, poolSize,
 									 &EdgeGatedSourceOps, "dependency objects");
 
-			MetadataSyncPoolRegisterTasks(pool, immediateObjectAddresses);
-			MetadataSyncPoolApplyEdges(pool, edgeList);
+			MetadataSyncPoolRegisterTasks(pool, orderedObjectAddressStore,
+										  orderedObjectAddressTupleDesc);
+			MetadataSyncPoolApplyEdges(pool, edgeStore, edgeTupleDesc);
 
 			RunMetadataSyncPool(pool);
 
 			CloseMetadataSyncPool(pool);
 		}
+
+		tuplestore_end(orderedObjectAddressStore);
+		tuplestore_end(edgeStore);
 
 		MemoryContextSwitchTo(oldContext);
 
@@ -5261,71 +5265,26 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 
 		LogMetadataSyncPhaseBoundary("finished", "parallel dependency object creation");
 
-		/*
-		 * immediateObjectAddresses doesn't contain distributed sequences
-		 * as GetDistributedObjectAddressListWithoutShellTablesAndSequences
-		 * excluded them; so need to (re)create them here in parallel over a
-		 * pool of connections, before the shell tables so each shell table's
-		 * column defaults can be re-associated with an already-created sequence.
-		 */
-		LogMetadataSyncPhaseBoundary("starting", "parallel sequence creation");
-
-		workerNode = NULL;
-		foreach_ptr(workerNode, context->activatedWorkerNodeList)
-		{
-			MetadataSyncPool *pool =
-				OpenMetadataSyncPool(context, workerNode, poolSize,
-									 &StreamingLeafSourceOps, "sequence creation");
-
-			OpenStreamingLeafSource(pool, DistObjectRelationId(),
-									SequenceStreamExtractOid, SequenceStreamBuilder);
-
-			RunMetadataSyncPool(pool);
-
-			CloseMetadataSyncPool(pool);
-		}
-
-		LogMetadataSyncPhaseBoundary("finished", "parallel sequence creation");
-
-		/*
-		 * immediateObjectAddresses doesn't contain shell tables as
-		 * GetDistributedObjectAddressListWithoutShellTablesAndSequences
-		 * excluded them; so need to (re)create them here in parallel
-		 * over a pool of connections.
-		 */
-		LogMetadataSyncPhaseBoundary("starting", "parallel shell table creation");
-
-		workerNode = NULL;
-		foreach_ptr(workerNode, context->activatedWorkerNodeList)
-		{
-			MetadataSyncPool *pool =
-				OpenMetadataSyncPool(context, workerNode, poolSize,
-									 &StreamingLeafSourceOps, "shell table creation");
-
-			OpenStreamingLeafSource(pool, DistPartitionRelationId(),
-									ShellTableStreamExtractOid, ShellTableStreamBuilder);
-
-			RunMetadataSyncPool(pool);
-
-			CloseMetadataSyncPool(pool);
-		}
-
-		LogMetadataSyncPhaseBoundary("finished", "parallel shell table creation");
-
-		/* and now create the deferred objects */
-		LogMetadataSyncPhaseBoundary("starting", "deferred dependent object creation");
-		if (list_length(deferredObjectAddresses) > 0)
-		{
-			SendDependencyCreationCommandsForObjects(context, deferredObjectAddresses);
-			pfree(deferredObjectAddresses);
-		}
-		LogMetadataSyncPhaseBoundary("finished", "deferred dependent object creation");
-
 		/* enable ddl propagation */
 		SendOrCollectCommandListToActivatedNodes(context,
 												 list_make1(ENABLE_DDL_PROPAGATION));
 		return;
 	}
+
+	/*
+	 * Collect all dependencies in creation order and get their ddl commands.
+	 */
+	List *dependencies = GetDistributedObjectAddressList();
+
+	/*
+	 * Depending on changes in the environment, such as the enable_metadata_sync guc
+	 * there might be objects in the distributed object address list that should currently
+	 * not be propagated by citus as they are 'not supported'.
+	 */
+	bool flushCaches = true;
+	dependencies = FilterObjectAddressListByPredicate(dependencies,
+													  &SupportedDependencyByCitus,
+													  flushCaches);
 
 	dependencies = OrderObjectAddressListInDependencyOrder(dependencies, flushCaches);
 
@@ -5381,145 +5340,6 @@ SendDependencyCreationCommands(MetadataSyncContext *context)
 
 	/* enable ddl propagation */
 	SendOrCollectCommandListToActivatedNodes(context, list_make1(ENABLE_DDL_PROPAGATION));
-}
-
-
-/*
- * ClassifyDependencyPoolTasks walks the topologically ordered dependency list and
- * returns the two object lists the dependency pool should create.
- *
- *   - Extension-owned objects are not included in neither immediateObjectAddresses
- *     nor deferredObjectAddresses.
- *   - Objects that depend ON a shell table are stashed in dependency order into
- *     deferredObjectAddresses.
- *   - immediateObjectAddresses contains the objects that should be created immediately
- *     by the dependency pool.
- *
- * The returned lists reuses the ObjectAddress pointers from the input list (no
- * copies); they are allocated in context->context so they outlive the per-node pools.
- */
-static void
-ClassifyDependencyPoolTasks(MetadataSyncContext *context, List *dependencies,
-							List **immediateObjectAddresses,
-							List **deferredObjectAddresses)
-{
-	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
-
-	MemoryContext perObjectContext =
-		AllocSetContextCreate(context->context,
-							  "dependency pool classification per object context",
-							  ALLOCSET_DEFAULT_SIZES);
-
-	ObjectAddress *dependency = NULL;
-	int64 processedCount = 0;
-	foreach_ptr(dependency, dependencies)
-	{
-		processedCount++;
-
-		MemoryContextReset(perObjectContext);
-		MemoryContextSwitchTo(perObjectContext);
-
-		if (IsAnyObjectAddressOwnedByExtension(list_make1(dependency), NULL))
-		{
-			FlushMetadataSyncCachesIfNeeded(context, processedCount);
-			continue;
-		}
-
-		if (IsDependentOnShellTableObject(dependency))
-		{
-			MemoryContext stashContext = MemoryContextSwitchTo(context->context);
-			ObjectAddress *deferredAddress = palloc0(sizeof(ObjectAddress));
-			*deferredAddress = *dependency;
-			*deferredObjectAddresses = lappend(*deferredObjectAddresses, deferredAddress);
-			MemoryContextSwitchTo(stashContext);
-
-			FlushMetadataSyncCachesIfNeeded(context, processedCount);
-			continue;
-		}
-
-		/* this object is a pool task; keep the input pointer */
-		MemoryContext appendContext = MemoryContextSwitchTo(context->context);
-		*immediateObjectAddresses = lappend(*immediateObjectAddresses, dependency);
-		MemoryContextSwitchTo(appendContext);
-
-		FlushMetadataSyncCachesIfNeeded(context, processedCount);
-	}
-
-	MemoryContextSwitchTo(oldContext);
-	MemoryContextDelete(perObjectContext);
-}
-
-
-/*
- * SendDependencyCreationCommandsForObjects
- */
-static void
-SendDependencyCreationCommandsForObjects(MetadataSyncContext *context,
-										 List *objectAddresses)
-{
-	MemoryContext oldContext = MemoryContextSwitchTo(context->context);
-
-	/*
-	 * perObjectContext holds each object's deparse scratch and is reset every
-	 * iteration so it does not accumulate.
-	 */
-	MemoryContext perObjectContext = AllocSetContextCreate(context->context,
-														   "deferred dependent per object context",
-														   ALLOCSET_DEFAULT_SIZES);
-
-	int64 processedCount = 0;
-	ObjectAddress *dependency = NULL;
-	foreach_ptr(dependency, objectAddresses)
-	{
-		MemoryContextReset(perObjectContext);
-		MemoryContextSwitchTo(perObjectContext);
-
-		bool bundlePartitionMetadata = true;
-		List *ddlCommands = GetAllDependencyCreateDDLCommands(list_make1(dependency),
-															  bundlePartitionMetadata);
-		SendOrCollectCommandListToActivatedNodes(context, ddlCommands);
-
-		FlushMetadataSyncCachesIfNeeded(context, ++processedCount);
-		LogMetadataSyncProgress("deferred dependent objects",
-								processedCount - 1, processedCount,
-								list_length(objectAddresses));
-	}
-
-	MemoryContextSwitchTo(oldContext);
-
-	MemoryContextDelete(perObjectContext);
-
-	ResetMetadataSyncMemoryContext(context);
-}
-
-
-/*
- * IsDependentOnShellTableObject returns true if the given distributed object's
- * creation DDL references a Citus shell table, and therefore must be created
- * AFTER the shell table phase when the shell table pool path is enabled.
- *
- * These are:
- *  - views and materialized views (their definition selects from the table), and
- *  - publications (CREATE PUBLICATION ... FOR TABLE names the specific table).
- */
-static bool
-IsDependentOnShellTableObject(const ObjectAddress *dependency)
-{
-	if (dependency->classId == PublicationRelationId)
-	{
-		return true;
-	}
-
-	if (getObjectClass(dependency) == OCLASS_CLASS)
-	{
-		char relKind = get_rel_relkind(dependency->objectId);
-		if (relKind == RELKIND_VIEW || relKind == RELKIND_MATVIEW)
-		{
-			return true;
-		}
-	}
-
-	return false;
 }
 
 
