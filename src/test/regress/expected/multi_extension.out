@@ -1408,6 +1408,24 @@ SELECT * FROM multi_extension.print_extension_changes();
                  | function citus_schema_move(regnamespace,text,integer,citus.shard_transfer_mode) void
 (5 rows)
 
+-- Test downgrade to 12.1-1 from 12.1-2
+ALTER EXTENSION citus UPDATE TO '12.1-2';
+ALTER EXTENSION citus UPDATE TO '12.1-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+ previous_object | current_object
+---------------------------------------------------------------------
+(0 rows)
+
+-- Snapshot of state at 12.1-2
+ALTER EXTENSION citus UPDATE TO '12.1-2';
+SELECT * FROM multi_extension.print_extension_changes();
+ previous_object |                        current_object
+---------------------------------------------------------------------
+                 | function worker_drop_shell_table_and_partition_row(text) void
+                 | function worker_drop_shell_table_edges(integer)
+(2 rows)
+
 DROP TABLE multi_extension.prev_objects, multi_extension.extension_diff;
 -- show running version
 SHOW citus.version;

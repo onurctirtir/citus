@@ -208,6 +208,10 @@ extern void FlushMetadataSyncCachesIfNeeded(MetadataSyncContext *context,
 #define DELETE_ALL_TENANT_SCHEMAS "DELETE FROM pg_catalog.pg_dist_schema"
 #define WORKER_DROP_ALL_SHELL_TABLES \
 	"CALL pg_catalog.worker_drop_all_shell_tables(%s)"
+#define WORKER_DROP_SHELL_TABLE_EDGES \
+	"CALL pg_catalog.worker_drop_shell_table_edges()"
+#define WORKER_DROP_SHELL_TABLE_AND_PARTITION_ROW \
+	"SELECT pg_catalog.worker_drop_shell_table_and_partition_row(%s)"
 #define CITUS_INTERNAL_MARK_NODE_NOT_SYNCED \
 	"SELECT citus_internal_mark_node_not_synced(%d, %d)"
 

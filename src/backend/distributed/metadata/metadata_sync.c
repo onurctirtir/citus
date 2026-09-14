@@ -185,6 +185,8 @@ static char * RemoteCollationIdExpression(Oid colocationId);
 static char * RemoteTableIdExpression(Oid relationId);
 
 static void LogMetadataSyncPhaseBoundary(const char *state, const char *phase);
+static void SendShellTableDeletionCommandsViaPool(MetadataSyncContext *context);
+static List * ShellTableDropDeparseBuilder(Oid relationId);
 
 
 PG_FUNCTION_INFO_V1(start_metadata_sync_to_all_nodes);
@@ -4848,10 +4850,147 @@ SendShellTableDeletionCommands(MetadataSyncContext *context)
 	char *breakSeqDepsCommand = BREAK_ALL_CITUS_TABLE_SEQUENCE_DEPENDENCY_COMMAND;
 	SendOrCollectCommandListToActivatedNodes(context, list_make1(breakSeqDepsCommand));
 
+	/*
+	 * Remove shell tables. When the pool path is enabled (nontransactional mode
+	 * with citus.metadata_sync_use_pool on), drop them in parallel over a pool of
+	 * connections instead of the single worker-side plpgsql loop, which commits
+	 * one table per transaction and takes hours on clusters with millions of
+	 * shell tables. The serial path stays the fallback (and the only option in
+	 * transactional mode, where the drops must share one distributed transaction).
+	 */
+	if (MetadataSyncUsePoolEnabled(context))
+	{
+		LogMetadataSyncPhaseBoundary("starting", "parallel shell table deletion");
+
+		/*
+		 * Phase 1 (serial): remove the cross-table drop edges among shell tables
+		 * so that the parallel drop phase cannot deadlock. Dropping a shell table
+		 * (like DROP TABLE) locks both endpoints of a foreign key and, for a
+		 * partitioned parent, CASCADEs onto every child taking AccessExclusiveLock;
+		 * dropping two such related tables concurrently over two pool connections
+		 * would deadlock. The worker-side procedure drops every foreign key
+		 * touching a shell table and detaches every shell-table partition,
+		 * committing in bounded batches so it never exhausts
+		 * max_locks_per_transaction, so afterwards every shell table is standalone
+		 * and the pool can drop them independently. This mirrors how the shell
+		 * table CREATE path defers ATTACH PARTITION and ADD FOREIGN KEY to a
+		 * serial inter-table phase: the create-time cross-table edges reappear as
+		 * drop-time cross-table locks, and both are handled serially.
+		 */
+		char *dropEdgesCommand = WORKER_DROP_SHELL_TABLE_EDGES;
+		SendOrCollectCommandListToActivatedNodes(context, list_make1(dropEdgesCommand));
+
+		/*
+		 * Phase 2 (parallel): drop the now-independent shell tables over the pool.
+		 * Each drop also deletes the table's own pg_dist_partition row in the same
+		 * command (worker_drop_shell_table_and_partition_row), which is what makes
+		 * phase 3 cheap.
+		 */
+		SendShellTableDeletionCommandsViaPool(context);
+
+		/*
+		 * Phase 3 (serial safety net): the coordinator only drove drops for the
+		 * tables it currently tracks in its pg_dist_partition. A partial earlier
+		 * sync can leave orphan shell tables on the worker that the coordinator no
+		 * longer knows about; sweep them with the stock worker-side loop. Because
+		 * phase 2 deleted the pg_dist_partition row of every table it dropped,
+		 * this loop now iterates a near-empty pg_dist_partition, so its per-row
+		 * COMMIT cost is paid only for the few orphans instead of all shell
+		 * tables.
+		 */
+		char *dropOrphansCommand = WorkerDropAllShellTablesCommand(false);
+		SendOrCollectCommandListToActivatedNodes(context,
+												 list_make1(dropOrphansCommand));
+
+		LogMetadataSyncPhaseBoundary("finished", "parallel shell table deletion");
+
+		return;
+	}
+
 	/* remove shell tables */
 	bool singleTransaction = (context->transactionMode == METADATA_SYNC_TRANSACTIONAL);
 	char *dropShellTablesCommand = WorkerDropAllShellTablesCommand(singleTransaction);
 	SendOrCollectCommandListToActivatedNodes(context, list_make1(dropShellTablesCommand));
+}
+
+
+/*
+ * SendShellTableDeletionCommandsViaPool drops the shell tables of all Citus
+ * tables on the activated nodes using the wave-less connection pool's
+ * streaming-leaf source: it scans the COORDINATOR's pg_dist_partition (the
+ * authoritative source, as in DropOrphanedShellTablesOnNode) and deparses one
+ * worker_drop_shell_table_and_partition_row() call per table on dispatch, so it
+ * never materializes a list of the (up to ~10M) tables or their command strings --
+ * only one task per connection is live at a time.
+ *
+ * This is the parallel counterpart of the serial WorkerDropAllShellTablesCommand()
+ * teardown (a single worker-side plpgsql loop over the worker's
+ * pg_dist_partition, committing one table per transaction). It is only reached in
+ * nontransactional mode with citus.metadata_sync_use_pool on (see
+ * MetadataSyncUsePoolEnabled()). The caller breaks the shell tables' sequence
+ * dependencies (and their cross-table drop edges) before this runs, so a table's
+ * DROP CASCADE cannot drop a distributed sequence, or deadlock against a sibling
+ * table's drop, out from under this phase.
+ */
+static void
+SendShellTableDeletionCommandsViaPool(MetadataSyncContext *context)
+{
+	int poolSize = MaxAdaptiveExecutorPoolSize;
+
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, context->activatedWorkerNodeList)
+	{
+		MetadataSyncPool *pool =
+			OpenMetadataSyncPool(context, workerNode, poolSize,
+								 &StreamingLeafSourceOps, "shell tables");
+
+		OpenStreamingLeafSource(pool, DistPartitionRelationId(),
+								FetchRelationIdFromPgPartitionHeapTuple,
+								ShellTableDropDeparseBuilder);
+
+		RunMetadataSyncPool(pool);
+
+		CloseMetadataSyncPool(pool);
+	}
+}
+
+
+/*
+ * ShellTableDropDeparseBuilder builds the command that drops one distributed
+ * table's shell table on the target node, together with that table's
+ * pg_dist_partition row: SELECT
+ * pg_catalog.worker_drop_shell_table_and_partition_row('<name>').
+ *
+ * Unlike the dependency-creation path's deparse callback, this does not open the
+ * relation (so it needs no lock-releasing subtransaction): generate_qualified_
+ * relation_name only does syscache lookups, keeping coordinator lock usage flat
+ * across the whole scan even on clusters with millions of shell tables. If the
+ * relation was dropped on the coordinator concurrently there is nothing to sweep
+ * on the worker either, so we return NIL and the pool completes the task inline
+ * (occupying no connection).
+ *
+ * worker_drop_shell_table_and_partition_row() is used rather than a plain DROP
+ * TABLE because a plain DROP fires the Citus drop event trigger on the (still MX)
+ * worker, which calls coordinator-only metadata functions and errors out. The UDF
+ * removes the shell table via an internal performDeletion(), deletes the table's
+ * pg_dist_partition row in the same command, and is a no-op (with a NOTICE) if the
+ * relation no longer exists on the worker -- matching
+ * DropOrphanedShellTablesOnNode.
+ */
+static List *
+ShellTableDropDeparseBuilder(Oid relationId)
+{
+	if (get_rel_name(relationId) == NULL)
+	{
+		return NIL;
+	}
+
+	char *qualifiedName = generate_qualified_relation_name(relationId);
+	char *dropCommand =
+		psprintf(WORKER_DROP_SHELL_TABLE_AND_PARTITION_ROW,
+				 quote_literal_cstr(qualifiedName));
+
+	return list_make1(dropCommand);
 }
 
 
